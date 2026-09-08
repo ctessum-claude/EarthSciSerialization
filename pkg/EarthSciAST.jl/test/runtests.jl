@@ -161,6 +161,7 @@ include("testutils.jl")  # shared prelude: repo root, AST builders, _normj, _req
         include("reactant_scan_test.jl")             # traced prefix scan ≢ grid size
         include("reactant_oop_intern_test.jl")       # one emitted read per (SSA value, window)
         include("reactant_oop_ssa_test.jl")          # ess-oop-ssa: skipped scatters/redirects visible in the raw module
+        include("reactant_oop_levelbase_test.jl")    # ess-oop-levelbase: one read version per fill level; intermediate `ue` versions single-use
         include("reactant_oop_gvn_test.jl")          # one emitted OP per (opcode, operand values)
     else
         @info "skipping reactant_oop_test.jl (set ESM_TEST_REACTANT=1, with Reactant " *

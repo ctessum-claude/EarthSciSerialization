@@ -80,7 +80,7 @@ module EarthSciASTReactantExt
 using Reactant: Reactant, TracedRArray, TracedRNumber, @allowscalar
 
 import EarthSciAST: _oop_read_state, _oop_gather, _oop_du_zeros, _oop_store,
-    _oop_scatter, _oop_read_forcing, _oop_prefix_copy,
+    _oop_scatter, _oop_read_forcing, _oop_prefix_copy, _oop_read_version,
     _oop_knot_count, _oop_knot_pair, _oop_knot_pair2, _oop_bilinear_corners,
     _scan_lanes_oop, _ScanFold, _oop_new_memo, _oop_intern_tally!,
     _oop_op, _oop_const, _oop_powlit, _oop_gvn_tally!,
@@ -255,6 +255,17 @@ end
 @inline _rx_rewrap(v::TracedRArray{T,N}) where {T,N} =
     TracedRArray{T,N}(v.paths, v.mlir_data, v.shape)
 @inline _rx_rewrap(v) = v
+
+# ---- The frozen read version (ess-oop-levelbase) ----------------------------
+#
+# `_oop_store` / `_oop_scatter` below REBIND the container's `mlir_data`, so a
+# Julia reference to `ue` is a reference to whatever version `ue` is at NOW, not
+# to the version it held when the reference was taken. The rewrap above is
+# exactly the handle that pins a version: same value, own wrapper, no op
+# emitted. `_oop_fill_level` takes one per dependency level so the level's
+# reads cannot be moved onto its own writes — see the note there for why the
+# adjoint of the extended-buffer prelude depends on it.
+@inline _oop_read_version(v::TracedRArray) = _rx_rewrap(v)
 
 # ---- Stencil shifts as affine slices (ess-oop-shift-slice) -----------------
 #

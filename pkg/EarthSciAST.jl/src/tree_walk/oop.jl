@@ -351,6 +351,27 @@ end
 
 @inline _oop_store(du, i::Int, v) = (@inbounds du[i] = v; du)
 
+# ---- The frozen READ version of a container (ess-oop-levelbase) -------------
+#
+# A fourth member of the family, and the only one that is a NO-OP on host by
+# construction. On host the writes above MUTATE, so "the container as it was
+# before this level's writes" and "the container now" are the same object and
+# there is nothing to freeze — this method returns its argument and the host
+# RHS is byte for byte what it was. Under a trace the write seams REBIND the
+# traced value carried by the container object, so holding a Julia reference
+# does NOT hold a version; a backend overrides this to hand back a fresh
+# handle onto the CURRENT SSA value, which later writes then cannot move.
+#
+# `_oop_fill_level` uses it to give a whole dependency level ONE read version.
+# See the note there for why that is value-exact and what it buys the adjoint.
+@inline _oop_read_version(x) = x
+
+# ess-oop-levelbase's kill switch. A `Ref` rather than a build-time constant on
+# purpose: the flag changes only how the WALK threads versions, nothing the
+# build decided, so one build can be traced both ways in one process — which is
+# how the A/B that priced it was run.
+const _OOP_LEVELBASE = Ref(get(ENV, "ESS_OOP_LEVELBASE", "1") != "0")
+
 # Seed the extended vector's STATE prefix from `u`, for the materialized-observed
 # prelude. A third member of the family above, and a seam for the same reason: on
 # host this is one `copyto!`, but a tracing backend needs it as ONE slice
@@ -2806,18 +2827,50 @@ forcing_buffer_index(f::_OopRHS) = f.buffer_index
 # shape batching exists for, and under a trace they were the last O(grid)
 # scalar surface. Singles first, then groups; disjoint slots + the
 # strictly-lower-level read invariant make that reorder value-exact.
+#
+# ONE READ VERSION PER LEVEL (ess-oop-levelbase, `ESS_OOP_LEVELBASE=0` to
+# restore the version-threaded form). The entries of a level read the state and
+# STRICTLY LOWER levels — never each other; that is what `_materialized_obs_
+# levels` (build.jl) constructs the levels FOR, what lets the batch surface
+# reorder singles ahead of groups, and what `_ssa_decompose` already relies on
+# (`prod_level[pid] < cons_level`). So every entry may read the version of `ue`
+# that existed when the level STARTED, and threading each write's result into
+# the next entry's reads buys nothing but a dependence.
+#
+# ON HOST IT BUYS NOTHING AND COSTS NOTHING: the write seams mutate, so
+# `_oop_read_version` hands back the same object and this is the loop it was.
+# UNDER A TRACE it is the whole cost of the observed prelude in REVERSE. Each
+# write is a `dynamic_update_slice` of the flat extended tensor, and version
+# k+1's reads made version k LIVE — so Enzyme could not collapse the chain
+# (`dus_slice_simplify` declines: intermediate versions are read, and the
+# gathers' scatter-adds land on them) and its adjoint became one FULL-BUFFER
+# zeroing `dynamic_update_slice` per write plus a copy-insertion copy per live
+# version. Measured on the ReSEACT transport RHS at CONUS (13x7x72, extended
+# length 247 423): the reverse carried 91 `broadcast`-rooted zeroing DUS over
+# the whole buffer — 22.4 M element writes, in SCALAR loops — for the sake of
+# zeroing a few thousand slots, ~27 % of the reverse's total element traffic.
+# With ONE read version per level the intermediate versions have a single use
+# each, so the writes are in-place and the adjoint reads the level's FINAL
+# cotangent directly.
 @inline function _oop_fill_level(ue, lvl, sb::_OopScalarBatches, p, t, ::Type{T},
                                  fb, empty_cache,
                                  ssaks::Vector{_OopSSAKernel}=_OOP_SSA_EMPTY_KS,
                                  vals::Vector{Any}=_OOP_SSA_NO_VALS) where {T}
     scalars, kernels, plans, scans = lvl
-    ue = _oop_run_scalar_batches(ue, sb, ue, p, t, empty_cache, fb)
+    lb = _OOP_LEVELBASE[]
+    # The level's own scalar entries read the version it started at.
+    rd = lb ? _oop_read_version(ue) : ue
+    ue = _oop_run_scalar_batches(ue, sb, rd, p, t, empty_cache, fb)
+    # ... and its kernels read the version after those (which is what kernel 1
+    # read in the threaded form, so the two forms agree entry by entry).
+    lb && (rd = _oop_read_version(ue))
     for j in eachindex(kernels)
         plan = plans[j]
+        st = lb ? rd : ue
         ue = plan.vectorizable ?
-             _oop_run_acc_vec(ue, ue, p, t, kernels[j], plan, T, fb,
+             _oop_run_acc_vec(ue, st, p, t, kernels[j], plan, T, fb,
                               _oop_ssa_k(ssaks, j), vals) :
-             _oop_run_acc_kernel(ue, ue, p, t, kernels[j], T)
+             _oop_run_acc_kernel(ue, st, p, t, kernels[j], T)
     end
     isempty(scans) || (ue = _apply_scan_folds_oop(ue, scans))
     return ue
