@@ -627,17 +627,60 @@ function _cg_side(ctx::_CGFunction, kc::_CGKernCtx, a::_AccDesc)
     return :x
 end
 
-# A state read of slot expression `i` from the buffer `side` names.
+# The buffer a state read of descriptor `a` addresses, as an expression: `u`
+# itself when the read may land in either buffer (or there is one), else a
+# local holding that buffer. WHICH buffer is run-time data (a geometry integer,
+# 0 for the state part and 1 for the observed part, `_cg_sbuf`), so two kernels
+# that differ only in which buffer they read emit the same code and share it
+# ("Shape sharing"). Both parts are read through one view type
+# (`_ObsShift`), the state part at offset 0, so the local's type is the same
+# for either.
+function _cg_buf(ctx::_CGFunction, kc::_CGKernCtx, a::_AccDesc, key)
+    side = _cg_side(ctx, kc, a)
+    side === :x && return :u
+    g = _cg_geo!(ctx, side === :s ? 0 : 1, _cg_gkey(key, :side))
+    mkey = (:sbuf, g)
+    got = get(ctx.nest.memo, mkey, nothing)
+    got === nothing || return got
+    b = _cg_name(ctx, "ub")
+    push!(ctx.nest.sink, :(local $b = _cg_sbuf(u, $g)))
+    ctx.nest.memo[mkey] = b
+    return b
+end
+_cg_bread(buf, i) = :($buf[$i])
+
+# A state read of slot expression `i` from the buffer `side` names (`:s`, `:o`
+# or `:x`), for the emitters that pick the buffer at build time.
 _cg_uread(side::Symbol, i) =
     side === :s ? :(_cg_bufS(u)[$i]) : side === :o ? :(_cg_oview(u)[$i]) : :(u[$i])
+
+# The buffer `k` of a slot space (`_cg_buf`): on a two-buffer slot space the
+# state part (`k == 0`) or the observed part, each as an `_ObsShift` so slot `i`
+# reads `buf[i]` in either; one plain vector is itself.
+@inline _cg_sbuf(x, ::Int) = x
+@inline _cg_sbuf(s::_ObsSplitVec, k::Int) = k == 0 ? _ObsShift(s.u, 0) : _ObsShift(s.o, s.n)
+
+# A state read through a slot table `tb` at `addr`, in the table's mode `cb`
+# (`_cg_conn_mode`): a table with no ghost entry (`-2`) is read through, a run
+# starting at slot `cb + 1` (`cb >= 0`) is addressed directly, and a table with
+# ghosts reads the ghost literal `0.0` at slot 0 — exactly `_fetch`'s read. One
+# package function rather than the three-way branch written out at every read:
+# the emitted code holds one call per read, and the branch is compiled once.
+# It inherits the caller's `@inbounds`, as the written-out branch did.
+Base.@propagate_inbounds function _cg_tblread(buf, tb::Vector{Int}, cb::Int, addr::Int)
+    cb == -2 && return buf[tb[addr]]
+    cb >= 0 && return buf[cb + addr]
+    s = tb[addr]
+    return s == 0 ? 0.0 : buf[s]
+end
 
 # ---- One access descriptor → one indexing expression (mirrors `_fetch`) -----
 # `key` identifies the descriptor (its table and position) for `_cg_geo!`.
 function _cg_fetch(ctx::_CGFunction, kc::_CGKernCtx, a::_AccDesc, key = nothing)
     k = a.kind
     if k === _AK_STATE_AFFINE
-        return _cg_uread(
-            _cg_side(ctx, kc, a),
+        return _cg_bread(
+            _cg_buf(ctx, kc, a, key),
             _cg_offset(kc.oln, _cg_geo!(ctx, a.delta, _cg_gkey(key, :delta), true))
         )
     elseif k === _AK_CONST_BOX || k === _AK_FORCING_BOX
@@ -654,13 +697,12 @@ function _cg_fetch(ctx::_CGFunction, kc::_CGKernCtx, a::_AccDesc, key = nothing)
             ]
         )
     elseif k === _AK_STATE_FIXED
-        return _cg_uread(_cg_side(ctx, kc, a), _cg_geo!(ctx, a.idx, _cg_gkey(key, :idx)))
+        return _cg_bread(_cg_buf(ctx, kc, a, key), _cg_geo!(ctx, a.idx, _cg_gkey(key, :idx)))
     elseif k === _AK_LOOP_IDX
         return :(Float64($(_cg_mi(kc, a.dim))))
     elseif k === _AK_ARR_FIXED
         return :($(_cg_tab!(ctx, a.arr))[$(_cg_geo!(ctx, a.idx, _cg_gkey(key, :idx)))])
     elseif k === _AK_STATE_TBL_BOX
-        s = _cg_name(ctx, "s")
         addr = _cg_boxaddr(ctx, kc, a.s1, a.s2, a.s3, a.off, a.sx, key)
         # A table that is one ascending run of slots with no ghost (the box of
         # an array laid out as one column-major block) reads the same slot as
@@ -670,23 +712,16 @@ function _cg_fetch(ctx::_CGFunction, kc::_CGKernCtx, a::_AccDesc, key = nothing)
         # the choice is run-time data (`_cg_conn_mode`) and the emitted code is
         # the same at every N; the branches are loop-invariant.
         cb = _cg_geo!(ctx, _cg_conn_mode(a.conn), _cg_gkey(key, :tblbase))
-        side = _cg_side(ctx, kc, a)
+        side = _cg_buf(ctx, kc, a, key)
         if cb isa Symbol
             # The version of the loop that runs only when every table it reads
             # is a run (`_cg_tbl_versions`).
-            ctx.nest.tblaffine && return _cg_uread(side, :($cb + $addr))
+            ctx.nest.tblaffine && return _cg_bread(side, :($cb + $addr))
             push!(ctx.nest.tblcbs, cb)
         end
         tb = _cg_tabh!(ctx, _cg_run_tbl(a.conn, _cg_affine_conn(a.conn)))
         ctx.nest.tblread = true
-        # Exactly `_fetch`'s ghost test: slot 0 ⇒ the ghost literal 0.0.
-        return :(
-            $cb == -2 ? $(_cg_uread(side, :($tb[$addr]))) :
-                $cb >= 0 ? $(_cg_uread(side, :($cb + $addr))) :
-                let $s = $tb[$addr]
-                    $s == 0 ? 0.0 : $(_cg_uread(side, s))
-            end
-        )
+        return :(_cg_tblread($side, $tb, $cb, $addr))
     elseif k === _AK_ARR_TBL_BOX
         addr = _cg_boxaddr(ctx, kc, a.s1, a.s2, a.s3, a.off, a.sx, key)
         ctx.nest.tblread = true
@@ -1726,11 +1761,20 @@ function _cg_row_fission(ctx::_CGFunction, Ks::Vector{_AccKernel}, parts)
         (r isa Expr && r.head === :ref && r.args[2] isa Int) || continue
         gval[a.args[1]] = ctx.geo[r.args[2]]
     end
+    # A state-buffer local (`_cg_buf`) compares as the buffer it holds.
+    for st in ctx.nest.sink
+        (st isa Expr && st.head === :local && st.args[1] isa Expr) || continue
+        a = st.args[1]
+        r = a.args[2]
+        (r isa Expr && r.head === :call && r.args[1] === :_cg_sbuf) || continue
+        gval[a.args[1]] = get(gval, r.args[3], -1)
+    end
     canon(e, q) = e === q.iv ? :_cgFI : e === q.oln ? :_cgFO :
         e isa Symbol ? get(gval, e, e) :
         e isa Expr ? Expr(e.head, Any[canon(a, q) for a in e.args]...) : e
     lazy(e) = e isa Expr && (
         e.head in (:if, :&&, :||, :let, :block) ||
+            (e.head === :call && e.args[1] === :_cg_tblread) ||
             _anyof(lazy, e.args)
     )
     _anyof(q -> lazy(q.val), parts) && return nothing
@@ -1803,6 +1847,7 @@ end
 _cg_is_uread(e::Expr) =
     e.head === :ref && (
     e.args[1] === :u ||
+        (e.args[1] isa Symbol && startswith(String(e.args[1]::Symbol), "_cgub")) ||
         (
         e.args[1] isa Expr && e.args[1].head === :call &&
             e.args[1].args[1] in (:_cg_bufS, :_cg_oview)
@@ -2612,6 +2657,227 @@ function _cg_transaction(emit, ctx::_CGFunction)
     end
 end
 
+# ---- Shape sharing -----------------------------------------------------------
+# A model applies one template to many variables — the same advection operator
+# to every tracer, the same region classes to every field — and the emitter
+# writes each application out as its own loop nest. The nests differ only in
+# the DATA they read: where (geometry integers, `_cg_geo!`) and which tables
+# (`_cg_tab!`). Compiled one by one, that repeated code is the bulk of a
+# section's compile time. So the section emits each distinct nest (its SHAPE)
+# once, as a loop over the kernels that share it, each iteration reading that
+# kernel's geometry and table positions from one row of a table.
+#
+# Every kernel is emitted in full, with its own data, exactly as when it is
+# compiled alone; only then are the emitted units compared. A unit's shape is
+# its code (with its split helpers) with every geometry read and every table
+# position replaced by a numbered hole, holes numbered in order of first
+# appearance, and every emitter-minted local renamed in order of first
+# appearance. Two units share a shape only when that text is equal, so every
+# emission decision a unit's data took (a unit stride kept literal, a slab's
+# literal extent, which tables are one object, row fission's hole) is in the
+# text, and a kernel runs the very code it would have run alone, reading the
+# same operands through the same operations: the values are bit-identical.
+# Literals, parameter reads, the buffer a read addresses and the value type
+# are code, not data, and stay in the shape.
+#
+# The member loop runs the kernels of one shape back to back at the place of
+# the first; the others leave their own places. That reordering is exact only
+# because every kernel of the section writes its own `du` slots and reads only
+# `u`, `p`, `t` and build data: sharing is used only when the section's
+# out-slots are globally unique (`_cg_covered_outs_disjoint`), the same fact
+# the threaded cell axis rests on. Each member walks its own chunk of cells
+# (`_cgci` of `_cgnc`) as it did alone, so a chunk still writes cells no other
+# chunk writes.
+#
+# A unit's invariant prologue is part of the unit (`_cg_unit`), so a shared
+# body computes its member's invariants at the head of each iteration — once
+# per call per member, never per cell.
+
+# One emitted unit (a kernel, or a row-fused group): its block and the range
+# of `ctx.helpers` its split helpers occupy.
+struct _CGUnit
+    lx::Any
+    cost::Int
+    h0::Int
+    h1::Int
+end
+
+# Whether shapes are shared in this build: the plan field, and the tuning's
+# `ESS_CODEGEN_SHARE_SHAPES` switch.
+_cg_share_shapes() = _compiler_plan_now().share_shapes && _tuning_now().share_shapes
+
+# Emit one unit as a transaction with a prologue of its own, prepended to its
+# block, so the unit's code holds everything it computes.
+function _cg_unit(emit, ctx::_CGFunction)
+    pro0 = ctx.prologue
+    ctx.prologue = _CGPrologue()
+    h0 = length(ctx.helpers)
+    try
+        r = _cg_transaction(emit, ctx)
+        r isa _Decline && return r
+        lx, cost, fscratch = r
+        pro = ctx.prologue.stmts
+        blk = isempty(pro) ? lx :
+            Expr(:block, Expr(:macrocall, Symbol("@inbounds"), LineNumberNode(0, Symbol("ess-codegen")), Expr(:block, pro...)), lx)
+        return (_CGUnit(blk, cost, h0, length(ctx.helpers)), fscratch)
+    finally
+        ctx.prologue = pro0
+    end
+end
+
+# An emitter-minted local or helper name (`_cg_name`: `_cg`, letters, digits),
+# other than a tab-group local (`_cggrpG`).
+function _cg_minted(s::Symbol)
+    n = String(s)
+    (length(n) > 4 && startswith(n, "_cg") && isletter(n[4]) && isdigit(n[end])) || return false
+    return !startswith(n, "_cggrp")
+end
+
+# The group number of a tab-group local `_cggrpG`, or 0.
+function _cg_grp_of(a)
+    a isa Symbol || return 0
+    n = String(a)
+    startswith(n, "_cggrp") || return 0
+    return something(tryparse(Int, n[7:end]), 0)
+end
+
+# The holes of a unit, in order of first appearance: `(:geo, k)` reads
+# geometry slot `k`, `(:tab, g, pos)` is the table at `pos` of group `g`.
+mutable struct _CGHoles
+    geo::Tuple{Int, Int}                  # (group, pos) of `ctx.geo`, or (0, 0)
+    ids::Dict{Tuple{Symbol, Int, Int}, Int}
+    list::Vector{Tuple{Symbol, Int, Int}}
+    ren::Dict{Symbol, Symbol}             # canonical names (keying only)
+end
+_CGHoles(geo) = _CGHoles(geo, Dict{Tuple{Symbol, Int, Int}, Int}(), Tuple{Symbol, Int, Int}[], Dict{Symbol, Symbol}())
+
+_cg_hole!(H::_CGHoles, h::Tuple{Symbol, Int, Int}) =
+    get!(H.ids, h) do
+        push!(H.list, h)
+        length(H.list)
+    end
+
+# Walk `ex`, numbering its holes. `canon = true` returns the keying form (holes
+# and minted names canonical); `canon = false` returns the shared form: holes
+# read from the member's row `_cgrow`, names unchanged. LineNumberNodes are
+# dropped from the keying form.
+function _cg_holes(H::_CGHoles, ex, canon::Bool)
+    if ex isa Symbol
+        canon && _cg_minted(ex) || return ex
+        return get!(() -> Symbol("_cgx", length(H.ren) + 1), H.ren, ex)
+    elseif ex isa LineNumberNode
+        return canon ? nothing : ex
+    elseif !(ex isa Expr)
+        return ex
+    end
+    if ex.head === :ref && length(ex.args) == 2 && ex.args[2] isa Int
+        a, k = ex.args
+        # A geometry read: `(_cggrpG[pos])[k]` with `(G, pos)` the geometry tab.
+        if a isa Expr && a.head === :ref && length(a.args) == 2 && a.args[2] isa Int &&
+                (_cg_grp_of(a.args[1]), a.args[2]) == H.geo
+            j = _cg_hole!(H, (:geo, k, 0))
+            return canon ? Expr(:hole, j) : :(_cgrow[$j])
+        end
+        # A table: `_cggrpG[pos]`.
+        g = _cg_grp_of(a)
+        if g > 0 && (g, k) != H.geo
+            j = _cg_hole!(H, (:tab, g, k))
+            return canon ? Expr(:ref, a, Expr(:hole, j)) : Expr(:ref, a, :(_cgrow[$j]))
+        end
+    end
+    args = Any[]
+    for x in ex.args
+        y = _cg_holes(H, x, canon)
+        (canon && x isa LineNumberNode) || push!(args, y)
+    end
+    return Expr(ex.head, args...)
+end
+
+# The split helpers' names of a unit.
+_cg_helper_name(h) = h.args[end].args[1].args[1]::Symbol
+
+# Append `_cgrow` to every call of a helper in `names`, and to each helper's
+# own parameters.
+function _cg_pass_row(ex, names::Set{Symbol})
+    ex isa Expr || return ex
+    args = Any[_cg_pass_row(x, names) for x in ex.args]
+    if ex.head === :call && !isempty(args) && args[1] isa Symbol && args[1] in names
+        push!(args, :_cgrow)
+    end
+    return Expr(ex.head, args...)
+end
+
+# The unit's shape key and hole list.
+function _cg_shape_key(ctx::_CGFunction, u::_CGUnit, geo)
+    H = _CGHoles(geo)
+    io = IOBuffer()
+    print(io, _cg_holes(H, u.lx, true))
+    for i in (u.h0 + 1):u.h1
+        print(io, "\n", _cg_holes(H, ctx.helpers[i], true))
+    end
+    return String(take!(io)), H.list
+end
+
+# A hole's value in a member's row: the geometry integer, or the table position.
+_cg_hole_value(ctx::_CGFunction, h::Tuple{Symbol, Int, Int}) =
+    h[1] === :geo ? ctx.geo[h[2]] : h[3]
+
+# Group the units by shape and return the section's loop nests `(expr, cost)`
+# in order: a unit alone keeps its own code; a shape of several becomes one
+# member loop at its first unit's place, the others' helpers dropped.
+function _cg_share_units!(ctx::_CGFunction, units::Vector{_CGUnit})
+    g = get(ctx.tabs.id, ctx.geo, nothing)
+    geo = g === nothing ? (0, 0) : g
+    keys = Vector{String}(undef, length(units))
+    holes = Vector{Vector{Tuple{Symbol, Int, Int}}}(undef, length(units))
+    members = Dict{String, Vector{Int}}()
+    for (i, u) in enumerate(units)
+        keys[i], holes[i] = _cg_shape_key(ctx, u, geo)
+        push!(get!(members, keys[i], Int[]), i)
+    end
+    drop = falses(length(ctx.helpers))
+    out = Tuple{Any, Int}[]
+    for (i, u) in enumerate(units)
+        ms = members[keys[i]]
+        if length(ms) == 1
+            push!(out, (u.lx, u.cost))
+            continue
+        end
+        first(ms) == i || continue
+        rows = Vector{Int}[Int[_cg_hole_value(ctx, h) for h in holes[m]] for m in ms]
+        for m in ms[2:end]
+            um = units[m]
+            drop[(um.h0 + 1):um.h1] .= true
+        end
+        H = _CGHoles(geo)
+        body = _cg_holes(H, u.lx, false)
+        hs = Any[_cg_holes(H, ctx.helpers[k], false) for k in (u.h0 + 1):u.h1]
+        names = Set{Symbol}(_cg_helper_name(h) for h in hs)
+        if !isempty(names)
+            body = _cg_pass_row(body, names)
+            for (j, k) in enumerate((u.h0 + 1):u.h1)
+                h = _cg_pass_row(hs[j], names)
+                push!(h.args[end].args[1].args, :_cgrow)
+                ctx.helpers[k] = h
+            end
+        end
+        rs = _cg_name(ctx, "rows")
+        mv = _cg_name(ctx, "m")
+        loop = quote
+            local $rs = $(_cg_tab!(ctx, rows))
+            for $mv in eachindex($rs)
+                local _cgrow = $rs[$mv]
+                $body
+            end
+        end
+        _tally_cascade!(:cg_shape_shared)
+        for _ in 2:length(ms); _tally_cascade!(:cg_shape_member); end
+        push!(out, (loop, u.cost))
+    end
+    any(drop) && (ctx.helpers = Any[ctx.helpers[k] for k in eachindex(ctx.helpers) if !drop[k]])
+    return out
+end
+
 # Emit + compile every codegen-able kernel into a RuntimeGeneratedFunction
 # `(du, u, p, t, tabs, ci, nchunks) -> nothing` — the per-CHUNK form of the
 # section (see `_cg_emit_kernel!`): each kernel's loop nest covers its cell
@@ -2634,7 +2900,7 @@ function _build_codegen_rhs(
     ctx = _CGFunction(budget, shared_cache; nst = nst)
     covered = fill(false, length(acc_kernels))
     reasons = fill(:none, length(acc_kernels))
-    kloops = Tuple{Any, Int}[]         # (loop-nest expr, its emitted-node cost)
+    units = _CGUnit[]
     # Row-fused groups (see `_cg_emit_rowgroup!`): a group is emitted at its
     # first member's position; if it declines, its members are emitted one by
     # one, exactly as without fusion.
@@ -2643,12 +2909,12 @@ function _build_codegen_rhs(
     for (j, K) in enumerate(acc_kernels)
         if haskey(groups, j)
             js = groups[j]
-            r = _cg_transaction(ctx) do
+            r = _cg_unit(ctx) do
                 _cg_emit_rowgroup!(ctx, _AccKernel[acc_kernels[m] for m in js])
             end
             if !(r isa _Decline)
-                lx, cost, fscratch = r
-                push!(kloops, (lx, cost))
+                unit, fscratch = r
+                push!(units, unit)
                 for m in js
                     covered[m] = true
                     ingroup[m] = true
@@ -2659,21 +2925,28 @@ function _build_codegen_rhs(
             end
         end
         ingroup[j] && continue
-        r = _cg_transaction(() -> _cg_emit_kernel!(ctx, K), ctx)
+        r = _cg_unit(() -> _cg_emit_kernel!(ctx, K), ctx)
         if r isa _Decline
             reasons[j] = r.reason
             _tally_cascade!(Symbol("codegen_decline_", r.reason))
         else
-            lx, cost, fscratch = r
-            push!(kloops, (lx, cost))
+            unit, fscratch = r
+            push!(units, unit)
             covered[j] = true
             _tally_cascade!(:codegen_kernel)
             # Shared-prelude read observability: this kernel compiled carrying
-            # at least one such read.
+            # at least one shared-prelude read.
             fscratch && _tally_cascade!(:cg_foreign_scratch_emit)
         end
     end
     any(covered) || return nothing
+    # Threaded cell axis: total covered cells + the global out-slot
+    # disjointness verdict, both facts of the BUILD (the runtime chunk verdict
+    # is `_sec_prep_threads!`'s). Shapes are shared only under that verdict
+    # (see "Shape sharing").
+    ncells, disjoint, work, rmw = _cg_covered_outs_disjoint(acc_kernels, covered)
+    kloops = (disjoint && _cg_share_shapes()) ? _cg_share_units!(ctx, units) :
+        Tuple{Any, Int}[(u.lx, u.cost) for u in units]
     ln = LineNumberNode(0, Symbol("ess-codegen"))
 
     # Outer locals a chunk may need as arguments: the table locals and every
@@ -2778,10 +3051,6 @@ function _build_codegen_rhs(
     # sub-function becomes its own generated function, arriving in a tuple
     # appended to `tabs` (`_cg_split_transport`).
     f, fns = _cg_finish(ctx, _CG_SECTION_ARGS, fndefs..., kernels)
-    # Threaded cell axis: total covered cells + the global out-slot
-    # disjointness verdict, both facts of the BUILD (the runtime chunk verdict
-    # is `_sec_prep_threads!`'s).
-    ncells, disjoint, work, rmw = _cg_covered_outs_disjoint(acc_kernels, covered)
     tabpack = _cg_tabpack(ctx, fns)
     return _CGBuilt(f, tabpack, covered, reasons, ncells, disjoint, work, rmw)
 end

@@ -46,6 +46,11 @@ struct CompilerPlan
     # per evaluation, read at each use. Off, every occurrence is emitted where
     # it stands.
     share_subtrees::Bool
+    # Kernels whose emitted code differs only in the data it reads (geometry,
+    # tables) share one compiled body, run once per kernel over a table of that
+    # data (codegen_kernel.jl, "Shape sharing"). Off, every kernel is its own
+    # code. `ESS_CODEGEN_SHARE_SHAPES=0` turns it off too.
+    share_shapes::Bool
     # ---- the array cascade ----
     stencil::Bool                 # the affine stencil tier
     array_contraction::Bool
@@ -588,6 +593,7 @@ struct _Tuning
     split_transport::String
     by_value_min_nodes::Int
     thread_min_work::Int
+    share_shapes::Bool
 end
 
 _env_int(name::String, default::Int) = something(tryparse(Int, get(ENV, name, "")), default)
@@ -605,6 +611,7 @@ _tuning_from_env() = _Tuning(
     get(ENV, "ESS_CODEGEN_SPLIT_TRANSPORT", ""),
     _CG_BY_VALUE_MIN_NODES[],
     _env_int("ESS_THREADS_MIN_WORK", _THREAD_MIN_WORK_DEFAULT),
+    get(ENV, "ESS_CODEGEN_SHARE_SHAPES", "") != "0",
 )
 
 struct _BuildContext

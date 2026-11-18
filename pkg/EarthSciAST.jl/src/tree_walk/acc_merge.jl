@@ -11,12 +11,9 @@
 # sequential fold).
 #
 # Lazy guards: `ifelse`/`and`/`or` short-circuit on every runner as in the
-# scalar walker, and a spine carrying one skips the merged CSE, so no value
-# computed only under a guard reaches an unconditional prelude.
-
-# Does this spine carry an op whose scalar evaluation is lazy?
-_acc_node_has_lazy(n::_Node) =
-    _node_any(m -> m.kind === _NK_OP && _op_lazy_from(m.op) > 0, n)
+# scalar walker, and the merged CSE gives a slot only to a value with an
+# occurrence outside every guarded operand, so no value computed only under a
+# guard reaches an unconditional prelude.
 
 # Cross-equation classes: `_compile_derivative_equations` pools every per-cell
 # equation's entries and groups them once, so structurally identical cells of
@@ -206,10 +203,11 @@ function _acc_from_cell_entries(entries::Vector{Tuple{Int, _Node}})::Vector{_Acc
         slots, nds = groups[sig]
         acc = _AccDesc[]
         spine = _acc_merge_nodes(nds, length(slots), acc)
-        # CSE + invariant hoisting on the merged spine — skipped on a
-        # lazy-bearing one (see the header) so the SCALAR reference stays lazy.
-        spine, cse = _acc_node_has_lazy(spine) ? (spine, _ACC_NO_CSE) :
-            _build_acc_cse(spine, acc)
+        # CSE + invariant hoisting on the merged spine. `_build_acc_cse` gives a
+        # slot only to a value with an occurrence outside every guarded operand,
+        # so a lazy-bearing spine keeps its guards: nothing evaluated only under
+        # a guard reaches the unconditional recipes.
+        spine, cse = _build_acc_cse(spine, acc)
         push!(
             kernels, _AccKernel(_outs_cells(slots), spine, acc, cse)
         )
