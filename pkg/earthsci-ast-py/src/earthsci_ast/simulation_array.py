@@ -1268,6 +1268,9 @@ class _NumpyRhsBuild:
     param_values: dict[str, float]
     ordered_observed: list[tuple[str, Expr]]
     elem_names: list[str]
+    # Keep the RHS input bindings for observed evaluation at saved times.
+    input_arrays: dict[str, np.ndarray]
+    axis_valued_input_names: frozenset[str]
     # State-free observeds materialized ONCE at build (the const-geometry hoist):
     # ``static_observed`` scalars land in ``static_observed_values``, arrays in
     # ``static_derived_rings``; ``varying_observed`` is the (dependency-ordered)
@@ -3446,6 +3449,8 @@ def _build_numpy_rhs(
         param_values=param_values,
         ordered_observed=ordered_observed,
         elem_names=elem_names,
+        input_arrays=loader_arrays,
+        axis_valued_input_names=axis_valued_names,
         varying_observed=varying_observed,
         static_observed_values=static_observed_values,
         static_derived_rings=static_derived_rings,
@@ -3558,6 +3563,8 @@ def observed_at_state(
             y=np.asarray(y, dtype=float),
             t=float(t),
             index_sets=flat.index_sets,
+            input_arrays=build.input_arrays,
+            axis_valued_input_names=build.axis_valued_input_names,
             derived_rings=dict(build.static_derived_rings),
             derived_extents=build.derived_extents,
             factor_scope=build.factor_scope,
@@ -3610,7 +3617,6 @@ def probe_output_time_observeds(
     flat: FlattenedSystem,
     build: _NumpyRhsBuild,
     t: float,
-    loader_arrays: dict[str, np.ndarray] | None = None,
 ) -> None:
     """Exercise the OUTPUT-TIME observed pass, for the rules nothing else did.
 
@@ -3669,7 +3675,8 @@ def probe_output_time_observeds(
         derived_rings={} if not varying else dict(build.static_derived_rings),
         # Bound exactly as `_simulate_with_numpy` binds it at an output node, so
         # the probe measures that pass rather than a differently-seeded twin.
-        input_arrays=loader_arrays if loader_arrays is not None else {},
+        input_arrays=build.input_arrays,
+        axis_valued_input_names=build.axis_valued_input_names,
         derived_extents=build.derived_extents,
         factor_scope=build.factor_scope,
         var_index_sets=build.var_index_sets,
@@ -3746,6 +3753,8 @@ def _simulate_observeds_only(
             y=y_empty,
             t=t,
             index_sets=flat.index_sets,
+            input_arrays=build.input_arrays,
+            axis_valued_input_names=build.axis_valued_input_names,
             derived_extents=build.derived_extents,
             factor_scope=build.factor_scope,
             var_index_sets=build.var_index_sets,
@@ -3914,7 +3923,8 @@ def _simulate_with_numpy(
                         # on a document whose right-hand side does not, which a
                         # strict `native` reads (correctly, given what it was
                         # handed) as a refusal.
-                        input_arrays=loader_arrays if loader_arrays is not None else {},
+                        input_arrays=build.input_arrays,
+                        axis_valued_input_names=build.axis_valued_input_names,
                         derived_extents=build.derived_extents,
                         factor_scope=build.factor_scope,
                         var_index_sets=build.var_index_sets,
@@ -3951,7 +3961,8 @@ def _simulate_with_numpy(
                             t=float(t_out[j]),
                             index_sets=flat.index_sets,
                             # See the note on the state-free branch above.
-                            input_arrays=loader_arrays if loader_arrays is not None else {},
+                            input_arrays=build.input_arrays,
+                            axis_valued_input_names=build.axis_valued_input_names,
                             derived_rings=dict(build.static_derived_rings),
                             derived_extents=build.derived_extents,
                             factor_scope=build.factor_scope,

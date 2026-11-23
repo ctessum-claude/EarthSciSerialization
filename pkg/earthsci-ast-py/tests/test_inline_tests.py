@@ -1621,3 +1621,59 @@ def test_run_inline_tests_batch_records_an_unreadable_document_as_a_row(tmp_path
     # A SINGLE document keeps the old behaviour: the load raises.
     with pytest.raises(Exception):  # noqa: B017 — the loader's own error type
         run_inline_tests(str(tmp_path / "bad.esm"))
+
+
+def test_stateless_observed_reads_shaped_override_at_saved_times():
+    doc = {
+        "esm": "1.0.0",
+        "metadata": {"name": "stateless_shaped_override"},
+        "index_sets": {"x": {"kind": "interval", "size": 1}},
+        "domain": {"temporal": {}},
+        "models": {
+            "M": {
+                "variables": {
+                    "k": {"type": "parameter", "units": "1/s", "shape": ["x"], "default": [2]},
+                    "y": {"type": "unknown", "units": "1"},
+                },
+                "equations": [
+                    {
+                        "lhs": "y",
+                        "rhs": {"op": "*", "args": [{"op": "index", "args": ["k", 1]}, "t"]},
+                    },
+                ],
+                "tests": [
+                    {
+                        "id": "override",
+                        "time_span": {"start": 0.0, "end": 1.0},
+                        "parameter_overrides": {"k": [4]},
+                        "assertions": [
+                            {"variable": "y", "time": 0.25, "expected": 1.0},
+                            {"variable": "y", "time": 0.75, "expected": 3.0},
+                        ],
+                    },
+                ],
+            },
+        },
+    }
+    results = run_inline_tests(load_string(json.dumps(doc)))
+    assert len(results) == 2
+    assert all(r.passed for r in results), [r.message for r in results if not r.passed]
+
+
+def test_trajectory_observed_reads_shaped_override():
+    doc = _array_observed_doc()
+    model = doc["models"]["M"]
+    model["variables"]["p"] = {
+        "type": "parameter",
+        "units": "1",
+        "shape": ["x"],
+        "default": [1, 1, 1],
+    }
+    model["equations"][1]["rhs"]["args"][1] = "p"  # h = u + p
+    case = model["tests"][0]
+    case["parameter_overrides"] = {"p": [2, 4, 6]}
+    # h at t=0 exposes the overridden field while depending on the ODE state.
+    case["assertions"] = [{"variable": "h", "time": 0.0, "coords": {"x": 2}, "expected": 4}]
+    results = run_inline_tests(load_string(json.dumps(doc)))
+    assert len(results) == 1
+    assert results[0].passed, results[0].message

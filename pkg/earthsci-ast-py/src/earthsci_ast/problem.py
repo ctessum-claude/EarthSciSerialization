@@ -1089,7 +1089,7 @@ def _esm_problem_under(
     # hoist and the static observeds ran inside `_build_numpy_rhs` above, which
     # is where the census found six sevenths of this binding's per-cell landings.
     if build is not None:
-        exercise_every_evaluation(flat, build, t0, loader_arrays=merged)
+        exercise_every_evaluation(flat, build, t0)
     elif engine in ("loaders", "discrete_providers"):
         # esm-libraries-spec §2.5.10 lists "the per-segment seed" among the
         # evaluations the compiler covers. A segmented engine compiles nothing at
@@ -1502,7 +1502,6 @@ def exercise_every_evaluation(
     flat: FlattenedSystem,
     build: _NumpyRhsBuild,
     t0: float,
-    loader_arrays: dict[str, Any] | None = None,
 ) -> None:
     """Run, at construction, the two evaluations the build itself does not.
 
@@ -1529,7 +1528,7 @@ def exercise_every_evaluation(
     except Exception:  # noqa: BLE001 — a non-refusal failure stays a run failure
         pass
     try:
-        probe_output_time_observeds(flat, build, float(t0), loader_arrays=loader_arrays)
+        probe_output_time_observeds(flat, build, float(t0))
     except CompilerRefusedRuleError:
         raise
     except Exception:  # noqa: BLE001 — see above
@@ -2649,9 +2648,7 @@ def remake(
                     prob.sample_time,
                 ),
             )
-            exercise_every_evaluation(
-                prob.flat, build, prob.sample_time, loader_arrays=prob.const_arrays
-            )
+            exercise_every_evaluation(prob.flat, build, prob.sample_time)
         elif rebind and prob.engine == "scalar":
             scalar_build = _build_scalar_rhs(
                 prob.flat, new_p, new_u0, cse=prob.cse, t0=new_tspan[0]
