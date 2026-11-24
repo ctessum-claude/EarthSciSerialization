@@ -57,7 +57,6 @@ pub(super) fn run_range(
         lscratch,
         exports_active,
         simd,
-        frame_off,
         #[cfg(not(target_arch = "wasm32"))]
         chain_scratch,
         ..
@@ -73,7 +72,7 @@ pub(super) fn run_range(
     let simd = *simd;
     let prog = env.prog;
     let slot_off: &[usize] = slot_off;
-    let slab = Slab::new(&mut slab_vec[*frame_off..], slot_off, &prog.tables.slots);
+    let slab = Slab::new(slab_vec, slot_off, &prog.tables.slots);
     pending.clear();
 
     // The open recurrence sweep, if any: the `Sweep` instruction's position
@@ -1223,8 +1222,23 @@ pub(super) unsafe fn exec_calls(
     let prog = env.prog;
     let calls = &prog.instrs[pc..pc + n];
     let mut ff = take_frames(prog, pc, funcs);
+    // The frames in the order of where their arguments start: calls over a
+    // run of equally spaced blocks (one tracer after another) then see each
+    // argument as one view with a constant step between frames.
+    let mut order: SmallVec<[usize; 16]> = (0..n).collect();
+    if n > 1 {
+        let key = |m: usize| -> SmallVec<[usize; 8]> {
+            prog.tables.calls[call_of(&calls[m]) as usize]
+                .arrays
+                .iter()
+                .map(|a| src_base(a, env, slab).0 as usize)
+                .collect()
+        };
+        order.sort_by_cached_key(|&m| key(m));
+    }
     ff.args.clear();
-    for ins in calls {
+    for &m in &order {
+        let ins = &calls[m];
         let target = slab.slot(out_of(ins));
         ff.args
             .push(&prog.tables.calls[call_of(ins) as usize], env, slab, target);
@@ -1233,8 +1247,8 @@ pub(super) unsafe fn exec_calls(
         funcs[func_of(prog, pc)] = Some(ff);
         return;
     }
-    for (k, ins) in calls.iter().enumerate() {
-        let out = out_of(ins);
+    for (k, &m) in order.iter().enumerate() {
+        let out = out_of(&calls[m]);
         let len = prog.tables.slots[out as usize].elems().max(1);
         // SAFETY: the result is the function's slot of the same box, in the
         // frame's own slab; `out` is this program's slot, written by this
@@ -1322,25 +1336,34 @@ pub(super) unsafe fn run_frames(
     forcing: super::ForcingView,
     declared: &HashSet<String>,
 ) -> bool {
+    let n = ff.args.n;
+    if ff.cap < n {
+        // Laid out for a power of two of frames, so a context that sees
+        // batches of a few sizes settles on one layout.
+        ff.lay_out(n.next_power_of_two());
+    }
     let super::FuncFrames {
         ctx,
-        frame_len,
-        cap,
+        tables,
+        slot_step,
+        codes,
+        layout_base,
         primed,
         args,
         by_instr,
         no_mirror,
         fused_frames,
+        fused_wide,
         fx,
+        wide,
         direct,
+        ..
     } = ff;
     let super::TapeCtx {
         prog: fprog, exec, ..
     } = &mut **ctx;
     let prog: &TapeProgram = fprog;
     let prep = prog.prepared();
-    let n = args.n;
-    let l = *frame_len;
     let (na, ns) = (prog.state_vars.len(), prog.params_len);
     let env_of = |k: usize| Env {
         prog,
@@ -1358,77 +1381,72 @@ pub(super) unsafe fn run_frames(
     let end = prog.instrs.len();
     let mut no_dy: [f64; 0] = [];
     if !*primed {
-        exec.frame_off = 0;
+        // Frame 0's layout is the context's own; the CONST storages are
+        // every frame's.
         run_range(&env_of(0), 0..prime_end, exec, &mut no_dy);
         super::refill_primed(prog, exec);
         *primed = true;
     }
-    if *cap < n {
-        // New frames start as frame 0: its CONST values are theirs.
-        exec.slab.resize(n * l, 0.0);
-        for k in *cap..n {
-            exec.slab.copy_within(0..l, k * l);
-        }
-        *cap = n;
-    }
     if !*by_instr || (n == 1 && direct.is_none()) {
         for k in 0..n {
-            exec.frame_off = k * l;
-            run_range(&env_of(k), prime_end..end, exec, &mut no_dy);
+            run_frame(
+                exec,
+                tables,
+                codes,
+                *layout_base,
+                k,
+                prime_end..end,
+                &env_of(k),
+            );
         }
-        exec.frame_off = 0;
         return false;
     }
     let envs: SmallVec<[Env; 8]> = (0..n).map(env_of).collect();
     let slots = &prog.tables.slots;
-    // The decoded scalar code serves every frame: they share one layout.
+    // Every frame's scalar code, decoded for its layout.
     exec.scalar.ensure(prog, &exec.slot_off, exec.layout);
+    for k in 1..n {
+        codes[k].ensure(prog, &tables[k], *layout_base + k as u64);
+    }
+    // Each array argument's step between consecutive frames, when constant.
+    let arg_step: SmallVec<[Option<isize>; 8]> = (0..na)
+        .map(|j| frame_step(n, |k| args.arrays[k * na + j] as isize / 8))
+        .collect();
     let dy_home: &[usize] = &prep.dy.home_quiet;
     let mut pc = prime_end;
     while pc < end {
         if let Entry::Block(b) = exec.scalar.at[pc] {
             let b = exec.scalar.blocks[b as usize];
             let mut faulted: SmallVec<[usize; 4]> = SmallVec::new();
-            {
-                let super::TapeExec {
-                    slab,
-                    slot_off,
-                    scalar,
-                    ..
-                } = &mut *exec;
-                for (k, env) in envs.iter().enumerate() {
-                    let fs = frame_slab(slab, l, k, slot_off, slots);
-                    // SAFETY: decoded against every frame's layout, the
-                    // instructions before it have run in this frame, and
-                    // this thread alone runs the frames.
-                    if unsafe { b.run(scalar, env, fs, &mut no_dy) }.is_none() {
-                        faulted.push(k);
-                    }
+            for (k, env) in envs.iter().enumerate() {
+                let code = if k == 0 {
+                    &mut exec.scalar
+                } else {
+                    &mut codes[k]
+                };
+                let fs = Slab::new(&mut exec.slab, &tables[k], slots);
+                // SAFETY: decoded against frame `k`'s layout, the
+                // instructions before it have run in this frame, and this
+                // thread alone runs the frames.
+                if unsafe { b.run(code, env, fs, &mut no_dy) }.is_none() {
+                    faulted.push(k);
                 }
             }
             // A gather faulted, the block having stored nothing: the general
             // path latches it.
             for k in faulted {
-                exec.frame_off = k * l;
-                run_range(&envs[k], pc..b.end, exec, &mut no_dy);
+                run_frame(exec, tables, codes, *layout_base, k, pc..b.end, &envs[k]);
             }
-            exec.frame_off = 0;
             pc = b.end;
             continue;
         }
         match &prog.instrs[pc] {
             Instr::Call { .. } => {
                 let len = calls_at(prog, pc);
-                let super::TapeExec {
-                    slab,
-                    slot_off,
-                    scratch,
-                    ..
-                } = &mut *exec;
+                let super::TapeExec { slab, scratch, .. } = &mut *exec;
                 let frames = Frames {
                     slab,
-                    l,
-                    slot_off,
+                    tables,
                     slots,
                 };
                 unsafe { exec_calls_frames(prog, pc, len, &envs, frames, &mut scratch.funcs) };
@@ -1438,47 +1456,72 @@ pub(super) unsafe fn run_frames(
             // A function's result is read from its slot; nothing publishes.
             Instr::Export { .. } => {}
             Instr::Fused { spec } if fused_frames[*spec as usize] => {
-                let super::TapeExec {
-                    slab,
-                    slot_off,
-                    simd,
-                    ..
-                } = &mut *exec;
+                let spec = *spec as usize;
                 // The group that defines the result writes it into the
                 // callers' slots.
                 let to = direct
                     .filter(|&(at, _)| at == pc)
                     .map(|(_, o)| (o, &args.targets[..]));
-                let mut slab_of = |k: usize| {
-                    // SAFETY: the frames are disjoint windows of the slab;
-                    // the group reads and writes them through the handles
-                    // one frame's operands at a time.
-                    let p = unsafe { slab.as_mut_ptr().add(k * l) };
-                    Slab::new(
-                        unsafe { std::slice::from_raw_parts_mut(p, l) },
-                        slot_off,
-                        slots,
-                    )
-                };
-                // SAFETY: every instruction before it has run in every
-                // frame, and this thread alone runs the frames.
-                unsafe {
-                    super::fused::exec_fused_frames(
-                        *spec as usize,
-                        prog,
-                        &envs,
-                        &mut slab_of,
-                        dy_home,
-                        *simd,
-                        fx,
-                        to,
-                    )
-                };
+                let super::TapeExec {
+                    slab,
+                    simd,
+                    scratch,
+                    ..
+                } = &mut *exec;
+                let ran_wide = fused_wide[spec]
+                    && unsafe {
+                        super::fused::exec_fused_wide(
+                            spec,
+                            prog,
+                            &super::fused::WideFrames {
+                                envs: &envs,
+                                tables,
+                                slot_step,
+                                arg_step: &arg_step,
+                                args_scalars: &args.scalars,
+                                n_scalars: ns,
+                                to,
+                            },
+                            slab,
+                            dy_home,
+                            *simd,
+                            wide,
+                            &mut scratch.fregs,
+                            &mut scratch.fscratch,
+                        )
+                    };
+                if !ran_wide {
+                    let base = slab.as_mut_ptr();
+                    let len = slab.len();
+                    let mut slab_of = |k: usize| {
+                        // SAFETY: the frames' slots are disjoint windows of
+                        // the slab; the group reads and writes them one
+                        // frame's operands at a time.
+                        Slab::new(
+                            unsafe { std::slice::from_raw_parts_mut(base, len) },
+                            &tables[k],
+                            slots,
+                        )
+                    };
+                    // SAFETY: every instruction before it has run in every
+                    // frame, and this thread alone runs the frames.
+                    unsafe {
+                        super::fused::exec_fused_frames(
+                            spec,
+                            prog,
+                            &envs,
+                            &mut slab_of,
+                            dy_home,
+                            *simd,
+                            fx,
+                            to,
+                        )
+                    };
+                }
             }
             ins if ins.may_run_on_worker() => {
                 let super::TapeExec {
                     slab,
-                    slot_off,
                     idx_tables,
                     simd,
                     scratch,
@@ -1487,7 +1530,7 @@ pub(super) unsafe fn run_frames(
                 for (k, env) in envs.iter().enumerate() {
                     let cx = Cx {
                         env,
-                        slab: frame_slab(slab, l, k, slot_off, slots),
+                        slab: Slab::new(slab, &tables[k], slots),
                         idx_tables,
                         simd: *simd,
                         dy_home,
@@ -1504,10 +1547,8 @@ pub(super) unsafe fn run_frames(
             // frame.
             _ => {
                 for (k, env) in envs.iter().enumerate() {
-                    exec.frame_off = k * l;
-                    run_range(env, pc..pc + 1, exec, &mut no_dy);
+                    run_frame(exec, tables, codes, *layout_base, k, pc..pc + 1, env);
                 }
-                exec.frame_off = 0;
             }
         }
         pc += 1;
@@ -1515,28 +1556,53 @@ pub(super) unsafe fn run_frames(
     direct.is_some()
 }
 
-/// Frame `k`'s window of a function context's slab (`l` elements a frame).
-fn frame_slab<'a>(
-    slab: &'a mut [f64],
-    l: usize,
+/// Run `range` of frame `k` through the instruction loop: its slot layout
+/// and scalar code swapped in for the call (frame 0's are the context's).
+fn run_frame(
+    exec: &mut super::TapeExec,
+    tables: &mut [Vec<usize>],
+    codes: &mut [ScalarCode],
+    layout_base: u64,
     k: usize,
-    slot_off: &'a [usize],
-    slots: &[SlotDesc],
-) -> Slab<'a> {
-    Slab::new(&mut slab[k * l..(k + 1) * l], slot_off, slots)
+    range: std::ops::Range<usize>,
+    env: &Env,
+) {
+    if k == 0 {
+        run_range(env, range, exec, &mut []);
+        return;
+    }
+    std::mem::swap(&mut exec.slot_off, &mut tables[k]);
+    std::mem::swap(&mut exec.scalar, &mut codes[k]);
+    let own = exec.layout;
+    exec.layout = layout_base + k as u64;
+    run_range(env, range, exec, &mut []);
+    exec.layout = own;
+    std::mem::swap(&mut exec.scalar, &mut codes[k]);
+    std::mem::swap(&mut exec.slot_off, &mut tables[k]);
+}
+
+/// `step` when `at(k) == at(0) + k * step` for every frame `k < n`.
+pub(super) fn frame_step(n: usize, at: impl Fn(usize) -> isize) -> Option<isize> {
+    if n < 2 {
+        return Some(0);
+    }
+    let a0 = at(0);
+    let step = at(1) - a0;
+    (2..n)
+        .all(|k| at(k) == a0 + k as isize * step)
+        .then_some(step)
 }
 
 /// The frames of a batched execution's slab, for the calls its body makes.
 struct Frames<'a> {
     slab: &'a mut Vec<f64>,
-    l: usize,
-    slot_off: &'a [usize],
+    tables: &'a [Vec<usize>],
     slots: &'a [SlotDesc],
 }
 
 impl Frames<'_> {
     fn get(&mut self, k: usize) -> Slab<'_> {
-        frame_slab(self.slab, self.l, k, self.slot_off, self.slots)
+        Slab::new(self.slab, &self.tables[k], self.slots)
     }
 }
 

@@ -125,3 +125,41 @@ fn a_lone_reference_is_no_batch() {
     let (prog, _) = oracle_ab(many_lookups(1, true, false));
     assert_eq!(batches(&prog), (0, 0));
 }
+
+/// `pick(a, x) = a[floor(x) + 4]`: past the end of `a` once `x >= 1`, so a
+/// call faults where its state does.
+fn faulting_batch(n_fields: usize) -> Value {
+    use super::test_support::{d_eq, doc, idx, lit, plus};
+    let mut vars = serde_json::Map::new();
+    vars.insert("C".into(), json!({"type": "unknown", "shape": ["c"]}));
+    let mut eqs = vec![json!({"lhs": "C", "rhs": lit(&[1.0, 2.0, 3.0, 4.0])})];
+    for k in 1..=n_fields {
+        let u = format!("u{k}");
+        vars.insert(u.clone(), json!({"type": "unknown", "shape": ["i"]}));
+        let x = idx(json!(u.clone()), &[json!("i")]);
+        let call = apply("pick", json!({"a": "C", "x": x}));
+        eqs.push(d_eq(&u, 5, plus(call, json!(k as f64))));
+    }
+    let mut d = doc(Value::Object(vars), eqs);
+    d["models"]["M"]["operators"] = json!({
+        "pick": {
+            "params": ["a", "x"],
+            "body": idx(json!("a"), &[plus(json!({"op": "floor", "args": ["x"]}), json!(4))])
+        }
+    });
+    d
+}
+
+/// A fault inside a batched call is reported as without batching: the
+/// latched fault (and `dy`) match the per-cell oracle's, on fresh scratches,
+/// whichever calls of the batch fault.
+#[test]
+fn a_fault_inside_a_batch_is_reported_as_without_batching() {
+    let compiled = super::test_support::compile(faulting_batch(3));
+    let prog = super::test_support::ab(&compiled, &super::test_support::no_params());
+    let (n_batches, n_calls) = batches(&prog);
+    assert!(
+        n_batches >= 1 && n_calls >= 3,
+        "{n_batches} batches of {n_calls} calls"
+    );
+}

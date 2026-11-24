@@ -233,9 +233,6 @@ pub(crate) struct TapeExec {
     primed_forcing_epoch: u64,
     /// The calling thread's scratch for straight-line instructions.
     scratch: Scratch,
-    /// Where the slab of the frame being run starts in `slab` (a function's
-    /// batched execution, [`FuncFrames`]); 0 otherwise.
-    frame_off: usize,
     /// Per fused group: the resolved positions of its folded gathers whose
     /// subscripts the CONST or SEGMENT section defines, refilled each time
     /// those sections run.
@@ -293,39 +290,57 @@ pub(super) struct Scratch {
 
 /// One thread's execution context of one function ([`TapeProgram::funcs`]),
 /// for one call or for the frames of a batched execution
-/// ([`super::batch`]): frame `k`'s slots live at `k * frame_len` in the
-/// context's slab, laid out alike, so the frames share the decoded scalar
-/// code, the index tables and the scratch. Frame 0 also runs a lone call.
+/// ([`super::batch`]).
+///
+/// The slab is laid out for `cap` frames, frame-minor: a storage the
+/// CONTINUOUS section writes holds every frame's copy side by side (frame `k`
+/// at `k * elems` from the storage's start), so a slot of all the frames is
+/// one `[frames, box]` block; a storage only the CONST section writes is
+/// shared by every frame (the CONST section reads no argument: a scalar
+/// argument, an array argument and the time are CONTINUOUS inside a
+/// function, so it runs once). `tables[k]` is frame `k`'s slot layout; frame
+/// 0's is also the context's own, so a lone call runs as frame 0.
 pub(super) struct FuncFrames {
-    pub(super) ctx: Box<TapeCtx>,
-    /// The slab length of one frame.
-    pub(super) frame_len: usize,
-    /// The frames the slab holds.
-    pub(super) cap: usize,
-    /// Whether the CONST section has run. A function's CONST section reads
-    /// no argument (a scalar argument, an array argument and the time are
-    /// CONTINUOUS inside a function), so it runs once, in frame 0; a frame
-    /// added later starts as a copy of frame 0.
-    pub(super) primed: bool,
+    ctx: Box<TapeCtx>,
+    /// The frames the slab is laid out for.
+    cap: usize,
+    /// Per frame: each slot's slab offset.
+    tables: Vec<Vec<usize>>,
+    /// Per slot: how far frame `k + 1`'s copy is from frame `k`'s (0 for a
+    /// storage the frames share).
+    slot_step: Vec<usize>,
+    /// Per frame `k > 0`: its decoded scalar code (frame 0's is the
+    /// context's), and the layout generation it is decoded for.
+    codes: Vec<interp::ScalarCode>,
+    layout_base: u64,
+    /// Whether the CONST section has run for the current layout.
+    primed: bool,
+    /// Per storage: whether every frame shares it.
+    shared: Vec<bool>,
     /// The arguments of the calls being executed, frame by frame.
-    pub(super) args: FrameArgs,
+    args: FrameArgs,
     /// Whether the body can run one instruction at a time across the frames:
     /// it has no branch region, no recurrence body and no per-instruction
     /// precision after its CONST part.
-    pub(super) by_instr: bool,
+    by_instr: bool,
     /// Per state variable: `false` (a function's state is its arguments,
     /// never mirrored).
-    pub(super) no_mirror: Vec<bool>,
+    no_mirror: Vec<bool>,
     /// Per fused group: whether it runs over all the frames at once
-    /// ([`fused::frames_ok`]).
-    pub(super) fused_frames: Vec<bool>,
+    /// ([`fused::frames_ok`]), and whether as one group over the frames'
+    /// `[frames, box]` views ([`fused::wide_ok`]).
+    fused_frames: Vec<bool>,
+    fused_wide: Vec<bool>,
     /// The scratch of a fused group run over the frames.
-    pub(super) fx: fused::FramesScratch,
+    fx: fused::FramesScratch,
+    /// Fused groups over the frames' views, by group, frame count and the
+    /// frame steps of their operands.
+    wide: rustc_hash::FxHashMap<fused::WideKey, Box<fused::WideGroup>>,
     /// `(pc, output)`: the fused group that defines the function's result,
     /// as that output, when it is the result's only definition and nothing
     /// after it reads the result: it writes each frame's result straight
     /// into the caller's slot ([`FrameArgs::targets`]).
-    pub(super) direct: Option<(usize, usize)>,
+    direct: Option<(usize, usize)>,
 }
 
 /// `(pc, output)` of the fused group that may write function `prog`'s
@@ -383,6 +398,13 @@ pub(super) struct FrameArgs {
 // execution before it reads them and meaningless between executions.
 unsafe impl Send for FrameArgs {}
 
+/// A fresh layout generation for [`FuncFrames`]' frames: each frame's scalar
+/// code is decoded for its own generation.
+fn next_layout_base() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32
+}
+
 impl FuncFrames {
     pub(super) fn new(prog: &Arc<TapeProgram>) -> Self {
         let tables = prog.slot_tables();
@@ -396,29 +418,104 @@ impl FuncFrames {
         // A function runs whole on the thread that calls it: independent
         // calls are what a call plan runs side by side.
         ctx.set_serial();
-        let frame_len = ctx.exec.slab.len();
-        FuncFrames {
+        // A storage is the frames' own when an instruction after the CONST
+        // part defines a slot in it.
+        let mut shared = vec![true; prog.slab.storages.len()];
+        for ins in &prog.instrs[prime_end..] {
+            ins.for_each_def(&tables, |sl| {
+                let st = prog.tables.slots[sl as usize].storage;
+                if st != u32::MAX {
+                    shared[st as usize] = false;
+                }
+            });
+        }
+        let mut ff = FuncFrames {
             ctx,
-            frame_len,
-            cap: 1,
+            cap: 0,
+            tables: Vec::new(),
+            slot_step: Vec::new(),
+            codes: Vec::new(),
+            layout_base: 0,
             primed: false,
+            shared,
             args: FrameArgs::default(),
             by_instr,
             no_mirror: vec![false; prog.state_vars.len()],
             fused_frames: prog.fused.iter().map(fused::frames_ok).collect(),
+            fused_wide: prog.fused.iter().map(fused::wide_ok).collect(),
             fx: Default::default(),
+            wide: Default::default(),
             direct: if by_instr { direct_result(prog) } else { None },
+        };
+        ff.lay_out(1);
+        ff
+    }
+
+    /// Lay the slab out for `cap` frames (see [`FuncFrames`]); the CONST
+    /// section runs again before the next execution.
+    pub(super) fn lay_out(&mut self, cap: usize) {
+        let prog = Arc::clone(&self.ctx.prog);
+        let storages = &prog.slab.storages;
+        let mut base = vec![0usize; storages.len()];
+        let mut at = 0usize;
+        for (st, d) in storages.iter().enumerate() {
+            if self.shared[st] {
+                base[st] = at;
+                at += d.elems.max(1);
+            }
         }
+        for (st, d) in storages.iter().enumerate() {
+            if !self.shared[st] {
+                // Each frame's block starts on a cache line.
+                at = at.div_ceil(8) * 8;
+                base[st] = at;
+                at += cap * d.elems.max(1);
+            }
+        }
+        let step: Vec<usize> = prog
+            .tables
+            .slots
+            .iter()
+            .map(|d| match d.storage {
+                u32::MAX => 0,
+                st if self.shared[st as usize] => 0,
+                st => storages[st as usize].elems.max(1),
+            })
+            .collect();
+        self.tables = (0..cap)
+            .map(|k| {
+                prog.tables
+                    .slots
+                    .iter()
+                    .zip(&step)
+                    .map(|(d, &sp)| match d.storage {
+                        u32::MAX => usize::MAX,
+                        st => base[st as usize] + k * sp,
+                    })
+                    .collect()
+            })
+            .collect();
+        self.slot_step = step;
+        self.cap = cap;
+        self.layout_base = next_layout_base();
+        self.codes = (0..cap).map(|_| interp::ScalarCode::default()).collect();
+        let exec = &mut self.ctx.exec;
+        exec.slab = vec![0.0; at.max(1)];
+        exec.slot_off.clone_from(&self.tables[0]);
+        exec.layout = self.layout_base;
+        self.wide.clear();
+        self.primed = false;
     }
 
     /// Where frame `k`'s result (the function's one export) starts in the
     /// context's slab.
     pub(super) fn result(&self, k: usize) -> *const f64 {
         let (_, result) = self.ctx.prog.exports[0];
-        let exec = &self.ctx.exec;
-        exec.slab
+        self.ctx
+            .exec
+            .slab
             .as_ptr()
-            .wrapping_add(k * self.frame_len + exec.slot_off[result as usize])
+            .wrapping_add(self.tables[k][result as usize])
     }
 }
 
@@ -466,7 +563,6 @@ impl TapeExec {
                 asm_parts: Vec::new(),
                 funcs: Vec::new(),
             },
-            frame_off: 0,
             idx_tables: fused::index_tables_for(prog),
             lscratch: lanes::LaneScratch::for_program(prog),
             exports_active: false,

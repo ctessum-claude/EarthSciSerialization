@@ -2869,3 +2869,370 @@ unsafe fn copy_short(src: *const f64, dst: *mut f64, n: usize) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// One fused group over the frames' views (`[frames, box]`), as ONE group.
+// ---------------------------------------------------------------------------
+
+/// Whether fused group `fs` can run as one group over the frames of a
+/// batched execution ([`exec_fused_wide`]): a group [`frames_ok`] admits
+/// that reads no gathered input.
+pub(super) fn wide_ok(fs: &FusedSpec) -> bool {
+    frames_ok(fs) && fs.inputs.iter().all(|i| i.gather.is_none())
+}
+
+/// A group over the frames: the group, the frame count, and per input and
+/// per scalar its step between frames (`i64::MIN`: a scalar the frames
+/// share).
+pub(in crate::simulate_array::tape) type WideKey = (u32, u32, SmallVec<[i64; 8]>);
+
+/// Where an input of a [`WideGroup`] starts for frame 0.
+#[derive(Clone, Copy)]
+enum WideSrc {
+    /// The group's own input.
+    Input(usize),
+    /// A scalar operand whose value differs between frames, read as an
+    /// input broadcast along each frame's run.
+    Scalar(usize),
+}
+
+/// A fused group made to run once over the frames of a batched execution:
+/// its box is the frames' boxes one after another, each input is a view
+/// with a constant step between frames (an input the frames share has step
+/// 0), and its schedule is the group's runs repeated frame after frame,
+/// merged where the frames' parts are contiguous. Each element is computed
+/// by the same micro-ops in the same order as for its frame alone.
+pub(in crate::simulate_array::tape) struct WideGroup {
+    fs: FusedSpec,
+    node_elems: Vec<usize>,
+    srcs: Vec<WideSrc>,
+    /// Whether the frames' runs merged: when they hardly do, the frames are
+    /// run one by one instead, which costs less than walking their runs.
+    merged: bool,
+}
+
+/// The frames of a batched execution, as [`exec_fused_wide`] reads them.
+pub(super) struct WideFrames<'a, 'e> {
+    pub(super) envs: &'a [super::Env<'e>],
+    /// Per frame: each slot's slab offset.
+    pub(super) tables: &'a [Vec<usize>],
+    /// Per slot: its step between frames.
+    pub(super) slot_step: &'a [usize],
+    /// Per array argument: its step between frames, when constant.
+    pub(super) arg_step: &'a [Option<isize>],
+    /// Every frame's scalar arguments, `n_scalars` a frame.
+    pub(super) args_scalars: &'a [f64],
+    pub(super) n_scalars: usize,
+    /// The output that is the function's result, and the callers' slots it
+    /// goes to.
+    pub(super) to: Option<(usize, &'a [*mut f64])>,
+}
+
+/// Run fused group `spec` of function program `prog` once over all the
+/// frames of `wf`, as one group over their views ([`WideGroup`]). Returns
+/// `false`, having run nothing, when an operand has no constant step between
+/// frames; the caller then runs it frame by frame.
+///
+/// # Safety
+/// As for [`exec_fused`], for every frame.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn exec_fused_wide(
+    spec: usize,
+    prog: &TapeProgram,
+    wf: &WideFrames,
+    slab: &mut [f64],
+    dy_home: &[usize],
+    simd: SimdLevel,
+    cache: &mut rustc_hash::FxHashMap<WideKey, Box<WideGroup>>,
+    fregs: &mut Vec<f64>,
+    scratch: &mut FusedScratch,
+) -> bool {
+    let fs = &prog.fused[spec];
+    let nk = wf.envs.len();
+    let n = fs.n_elems();
+    let slots = &prog.tables.slots;
+    fn frame_slab<'s>(slab: &'s mut [f64], table: &'s [usize], slots: &[SlotDesc]) -> Slab<'s> {
+        Slab::new(slab, table, slots)
+    }
+    // Each input's step between frames.
+    let mut steps: SmallVec<[i64; 8]> = SmallVec::new();
+    for inp in &fs.inputs {
+        let st = match inp.src {
+            SrcRef::Slot(s) => wf.slot_step[s as usize] as isize,
+            SrcRef::State(ix) => match wf.arg_step[ix as usize] {
+                Some(st) => st,
+                None => return false,
+            },
+        };
+        steps.push(st as i64);
+    }
+    // Each scalar's value in every frame: shared, or a view with a step.
+    let nsc = fs.scalars.len();
+    let mut svals: SmallVec<[f64; 8]> = SmallVec::new();
+    for op in &fs.scalars {
+        svals.push(resolve_scalar(
+            op,
+            &wf.envs[0],
+            frame_slab(slab, &wf.tables[0], slots),
+        ));
+    }
+    for (i, op) in fs.scalars.iter().enumerate() {
+        let shared = (1..nk).all(|k| {
+            resolve_scalar(op, &wf.envs[k], frame_slab(slab, &wf.tables[k], slots)).to_bits()
+                == svals[i].to_bits()
+        });
+        let st = if shared {
+            i64::MIN
+        } else {
+            match *op {
+                Operand::Param(_) => wf.n_scalars as i64,
+                Operand::Slot(s) => wf.slot_step[s as usize] as i64,
+                Operand::State(ix) => match wf.arg_step[ix as usize] {
+                    Some(st) => st as i64,
+                    None => return false,
+                },
+                Operand::Lit(_) | Operand::Time => i64::MIN,
+            }
+        };
+        steps.push(st);
+    }
+    // Outputs: a frame's box after another's; the result into the callers'
+    // slots when they are too.
+    for (o, &(_, slot)) in fs.outputs.iter().enumerate() {
+        let st = match wf.to {
+            Some((t, targets)) if t == o => {
+                match super::interp::frame_step(nk, |k| targets[k] as isize / 8) {
+                    Some(st) => st,
+                    None => return false,
+                }
+            }
+            _ if matches!(dy_home.get(slot as usize), Some(&super::UNSTORED)) => n as isize,
+            _ => wf.slot_step[slot as usize] as isize,
+        };
+        if st != n as isize && nk > 1 {
+            return false;
+        }
+    }
+    let key: WideKey = (spec as u32, nk as u32, steps.clone());
+    let wg = cache.entry(key).or_insert_with(|| {
+        Box::new(wide_group(
+            fs,
+            nk,
+            &steps[..fs.inputs.len()],
+            &steps[fs.inputs.len()..],
+        ))
+    });
+    if !wg.merged {
+        return false;
+    }
+    // Frame 0's operands.
+    let mut bases: SmallVec<[*const f64; 8]> = SmallVec::new();
+    let base0 = slab.as_ptr();
+    for src in &wg.srcs {
+        bases.push(match *src {
+            WideSrc::Input(i) => match fs.inputs[i].src {
+                SrcRef::Slot(s) => base0.wrapping_add(wf.tables[0][s as usize]),
+                SrcRef::State(ix) => wf.envs[0].arrays[ix as usize],
+            },
+            WideSrc::Scalar(i) => match fs.scalars[i] {
+                Operand::Param(p) => wf.args_scalars[p as usize..].as_ptr(),
+                Operand::Slot(s) => base0.wrapping_add(wf.tables[0][s as usize]),
+                Operand::State(ix) => wf.envs[0].arrays[ix as usize],
+                Operand::Lit(_) | Operand::Time => {
+                    unreachable!("frames share a literal and the time")
+                }
+            },
+        });
+    }
+    let base_mut = slab.as_mut_ptr();
+    let outs: SmallVec<[(GroupIx, *mut f64); 2]> = fs
+        .outputs
+        .iter()
+        .enumerate()
+        .map(|(o, &(reg, slot))| {
+            let p = match (wf.to, dy_home.get(slot as usize)) {
+                (Some((t, targets)), _) if t == o => targets[0],
+                (_, Some(&super::UNSTORED)) => std::ptr::null_mut(),
+                _ => base_mut.wrapping_add(wf.tables[0][slot as usize]),
+            };
+            (reg, p)
+        })
+        .collect();
+    let _ = nsc;
+    let g = Group {
+        fs: &wg.fs,
+        svals: &svals,
+        bases: &bases,
+        whole_src: WholeSrc(&[]),
+        outs: &outs,
+        red: std::ptr::null_mut(),
+        idx: &[],
+        node_elems: &wg.node_elems,
+        simd,
+        pre: None,
+    };
+    let need = (wg.fs.n_regs as usize + wg.fs.n_load_regs as usize) * FCHUNK;
+    if fregs.len() < need {
+        fregs.resize(need, 0.0);
+    }
+    // SAFETY: frame 0's operands and each frame's step lie in their sources
+    // (the steps were read off the frames' own views), and nothing else
+    // touches them meanwhile.
+    unsafe {
+        run_fused_window(
+            &g,
+            std::ptr::null_mut(),
+            fregs,
+            &mut scratch.cursor,
+            Window::all(&wg.node_elems),
+        )
+    };
+    true
+}
+
+/// [`WideGroup`] of `fs` over `nk` frames, its inputs' steps `in_steps` and
+/// its scalars' `sc_steps` (`i64::MIN`: shared).
+fn wide_group(fs: &FusedSpec, nk: usize, in_steps: &[i64], sc_steps: &[i64]) -> WideGroup {
+    let n = fs.n_elems();
+    let mut g = fs.clone();
+    let mut srcs: Vec<WideSrc> = (0..fs.inputs.len()).map(WideSrc::Input).collect();
+    // Per shifted input of the wide group: where its run starts relative to
+    // the original run, and its step.
+    enum Off {
+        /// The original shifted input `sx`.
+        Shifted(usize),
+        /// An aligned input read where the output is.
+        Aligned,
+        /// A scalar: one element per frame.
+        Scalar,
+    }
+    let mut offs: Vec<(Off, i64)> = Vec::new();
+    for sx in 0..n_shifted(fs) {
+        offs.push((Off::Shifted(sx), 0));
+    }
+    for (i, inp) in g.inputs.iter_mut().enumerate() {
+        match inp.shifted_ix {
+            Some(sx) => offs[sx as usize].1 = in_steps[i],
+            // Aligned: still aligned when its frames are the output's.
+            None if in_steps[i] == n as i64 => {}
+            None => {
+                inp.shifted_ix = Some(offs.len() as GroupIx);
+                inp.elem_stride = 1;
+                offs.push((Off::Aligned, in_steps[i]));
+            }
+        }
+    }
+    for (j, &st) in sc_steps.iter().enumerate() {
+        if st == i64::MIN {
+            continue;
+        }
+        let new_in = g.inputs.len() as GroupIx;
+        g.inputs.push(FusedInput {
+            src: SrcRef::Slot(0),
+            shifted_ix: Some(offs.len() as GroupIx),
+            src_shape: DimU::new(),
+            elem_stride: 0,
+            load_reg: GroupIx::MAX,
+            index: None,
+            gather: None,
+        });
+        offs.push((Off::Scalar, st));
+        srcs.push(WideSrc::Scalar(j));
+        let swap = |m: &mut MRef| {
+            if *m == MRef::Scal(j as GroupIx) {
+                *m = MRef::In(new_in);
+            }
+        };
+        for op in &mut g.micro {
+            match op {
+                MicroOp::Bin { a, b, .. } => {
+                    swap(a);
+                    swap(b);
+                }
+                MicroOp::Un { a, .. } | MicroOp::Neg { a, .. } | MicroOp::Mov { a, .. } => swap(a),
+                MicroOp::Select { cond, a, b, .. } => {
+                    swap(cond);
+                    swap(a);
+                    swap(b);
+                }
+                MicroOp::Bin2 { a, b, c, .. } => {
+                    swap(a);
+                    swap(b);
+                    swap(c);
+                }
+                MicroOp::Load { .. } | MicroOp::Scan { .. } => {
+                    unreachable!("`wide_ok` admits no load or scan")
+                }
+            }
+        }
+    }
+    let strides: Vec<i64> = {
+        let mut v = vec![1i64; offs.len()];
+        for inp in &g.inputs {
+            if let Some(sx) = inp.shifted_ix {
+                v[sx as usize] = inp.elem_stride;
+            }
+        }
+        v
+    };
+    let base_runs = fs.schedule.expanded();
+    let mut runs: Vec<FusedRun> = Vec::with_capacity(base_runs.len() * nk);
+    let unmerged = base_runs.len() * nk;
+    for k in 0..nk as i64 {
+        for r in &base_runs {
+            let in_off: SmallVec<[i64; 2]> = offs
+                .iter()
+                .map(|(o, st)| match *o {
+                    Off::Shifted(sx) => match r.in_off[sx] {
+                        GHOST_OFF => GHOST_OFF,
+                        v => v + k * st,
+                    },
+                    Off::Aligned => r.out_off as i64 + k * st,
+                    Off::Scalar => k * st,
+                })
+                .collect();
+            let next = FusedRun {
+                out_off: (r.out_off as i64 + k * n as i64) as u32,
+                len: r.len,
+                in_off,
+            };
+            // Merged into the run before when it continues it in the output
+            // and in every input.
+            if let Some(prev) = runs.last_mut() {
+                let len = prev.len as i64;
+                let continues =
+                    prev.out_off as i64 + len == next.out_off as i64
+                        && prev.in_off.iter().zip(&next.in_off).zip(&strides).all(
+                            |((&a, &b), &st)| {
+                                if a == GHOST_OFF || b == GHOST_OFF {
+                                    a == b
+                                } else {
+                                    a + len * st == b
+                                }
+                            },
+                        );
+                if continues {
+                    prev.len += next.len;
+                    continue;
+                }
+            }
+            runs.push(next);
+        }
+    }
+    // Worth one group only when the frames' runs at least halve.
+    let merged = runs.len() * 2 <= unmerged;
+    let nodes: Vec<RunNode> = runs.into_iter().map(RunNode::Run).collect();
+    g.shape = DimU::from_elem(n * nk, 1);
+    g.schedule = RunSchedule {
+        n_runs: nodes.len(),
+        nodes,
+        depth: 0,
+    };
+    let node_elems = super::super::prepared::node_elems(&g.schedule.nodes);
+    WideGroup {
+        fs: g,
+        node_elems,
+        srcs,
+        merged,
+    }
+}
