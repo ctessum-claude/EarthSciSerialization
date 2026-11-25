@@ -148,6 +148,11 @@ function _build_lower_and_classify(
     # one another — so it is materialized whatever the compiler, and whether or
     # not anything reads it: the output-time routes read the same buffer.
     union!(mat_array_vars, recur_vars)
+    # Likewise an array a call reads as its argument (call.jl
+    # `_hoist_array_arguments`): a call reads an array argument from a buffer.
+    for name in array_inline_vars
+        _is_argarr_name(name) && push!(mat_array_vars, name)
+    end
 
     return _VariableClasses(
         equations, folded_array_obs, geo.setup_vars, geo.defs, geom_inline_vars,
@@ -1304,10 +1309,13 @@ function _build_evaluator_impl_inner(
     # (`serialize_esm_file` emits them verbatim — R1).
     if _template_reg !== nothing
         model = _expansion_copy(model)
-        # The build's own registry: structural instances and view parts are
-        # registered in it, never in the caller's (call.jl `_tpl_prepare_model!`).
-        _template_reg = copy(_template_reg)
-        model, _ = _tpl_prepare_model!(model, _template_reg, index_sets, _vi_extents)
+        # Structural instances and view parts are registered in the template
+        # table's own copy of the registry, never in the caller's (frames.jl
+        # `_TplTable`).
+        model, calls = _tpl_prepare_model!(model, _template_reg, index_sets, _vi_extents)
+        # A computed array bound to an array parameter becomes the build's own
+        # array observed, passed by name (call.jl `_hoist_array_arguments`).
+        model, index_sets = _hoist_array_arguments(model, index_sets, calls.tt)
         _expand_cache = nothing
     elseif _model_has_surviving_refs(model)
         # A surviving reference with no registry in reach would compile into an

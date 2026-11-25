@@ -78,6 +78,16 @@ end
 
 The template instances of one build or analysis against the registry `reg`:
 the prepared bodies, the frames by instance key, and the binding-key memo.
+
+The table reads a COPY of `reg` (a shallow one: the declarations are shared,
+never mutated). What it registers — a structural instance
+(`_tpl_register_instance!`), a view part (`_tpl_skel`) — is the table's own and
+never reaches the caller's registry. A validation or analysis table is built on
+a document's own registry (`file.component_templates`), and an instance left
+there would be read later as one of the document's declarations: flatten closes
+every declaration (`_tpl_explicit_free`), which makes the names an instance's
+body was substituted with into parameters again, so its instance would be a
+structural template that no build can call.
 """
 mutable struct _TplTable
     reg::Any
@@ -89,7 +99,7 @@ mutable struct _TplTable
     root_memos::Dict{Symbol, Any}
 end
 _TplTable(reg) = _TplTable(
-    reg, Dict{String, _TplDef}(), Dict{Tuple{String, String}, _TplClosed}(),
+    reg isa AbstractDict ? copy(reg) : reg, Dict{String, _TplDef}(), Dict{Tuple{String, String}, _TplClosed}(),
     Dict{String, _TplFrame}(), IdDict{Any, IdDict{ASTExpr, String}}(), Set{String}(),
     Dict{Symbol, Any}()
 )
@@ -1433,6 +1443,22 @@ _tpl_array_binding(v::ASTExpr) =
     (v isa VarExpr && !occursin(_TPL_SENTINEL, v.name)) ||
     (v isa OpExpr && v.op == "const" && v.value isa AbstractVector)
 
+# The form an array-valued `faq` must have for the build to read it as an array
+# over its output indices: no reduction (every range is an output index's),
+# filter, join, key, `values` table or bounds, and a body. Shared by the lazy
+# route below and the buffered one (`_tpl_buffered_array_expr`).
+function _tpl_elementwise_faq_form(v::OpExpr)
+    _is_faq_op(v.op) || return false
+    oi = v.output_idx
+    (oi !== nothing && !isempty(oi) && all(x -> x isa AbstractString, oi)) || return false
+    (
+        v.filter === nothing && v.join_gates === nothing && v.join === nothing &&
+            v.key === nothing && v.expr_body !== nothing && v.values === nothing &&
+            v.lower === nothing && v.upper === nothing && all(a -> a isa VarExpr, v.args)
+    ) || return false
+    return v.ranges === nothing || all(k -> String(k) in oi, keys(v.ranges))
+end
+
 # An ARRAY EXPRESSION bound to an array parameter: an elementwise `faq` over
 # its output indices (no reduction, filter or join), whose element is read
 # lazily: where the body reads the parameter at subscripts `s…`, the element
@@ -1442,16 +1468,88 @@ _tpl_array_binding(v::ASTExpr) =
 # template table `tt`, also an element the build compiles into the instance
 # (`_tpl_inlinable`).
 function _tpl_array_expr(v::ASTExpr, tt::Union{Nothing, _TplTable} = nothing)
-    (v isa OpExpr && _is_faq_op(v.op)) || return false
-    oi = v.output_idx
-    (oi !== nothing && !isempty(oi) && all(x -> x isa AbstractString, oi)) || return false
-    (
-        v.filter === nothing && v.join_gates === nothing && v.join === nothing &&
-            v.key === nothing && v.expr_body !== nothing && v.values === nothing &&
-            v.lower === nothing && v.upper === nothing && all(a -> a isa VarExpr, v.args)
-    ) || return false
-    v.ranges === nothing || all(k -> String(k) in oi, keys(v.ranges)) || return false
+    (v isa OpExpr && _tpl_elementwise_faq_form(v)) || return false
     return tt === nothing || _tpl_inlinable(v.expr_body, tt)
+end
+
+# A COMPUTED ARRAY bound to an array parameter that is not an elementwise
+# `faq` read lazily (above): a `makearray`, a `faq` with output indices whose
+# element is no compiled-in expression, or a whole-array reference, read as its
+# view. The build evaluates it once in the caller, into a buffer of its own (an
+# internal array observed, call.jl `_hoist_array_arguments`), and passes that
+# buffer as the argument, as it passes a named array. Nothing is expanded: the
+# reference stays a call and the computed array is its argument. A `makearray`
+# or `faq` qualifies only when its extents are build-time integers
+# (`_argarr_extents`); a reference's are those of its view, known only once it
+# is read as one (call.jl `_hoist_array_arguments` refuses it otherwise).
+function _tpl_buffered_array_expr(v::ASTExpr, tt::_TplTable)
+    v isa OpExpr || return false
+    _tpl_is_call(v) && return !_tpl_is_elem(v) &&
+        (_tpl_view_rank(tt, v) > 0 || (_tpl_call_info(tt, v.name) === nothing && _tpl_skel(tt, v.name) !== nothing))
+    v.op == "makearray" && return v.values !== nothing && _argarr_extents(tt, v) !== nothing
+    _tpl_elementwise_faq_form(v) || return false
+    return _argarr_extents(tt, v) !== nothing
+end
+
+# A binding of an array parameter that the build passes through a buffer of its
+# own (`_tpl_buffered_array_expr`): not one it passes as it stands
+# (`_call_passable_array`) or reads lazily (`_tpl_array_expr`).
+_tpl_buffered_binding(b::ASTExpr, tt::_TplTable) =
+    b isa OpExpr && !_call_passable_array(b) && !_tpl_array_expr(b, tt) &&
+    _tpl_buffered_array_expr(b, tt)
+
+# The keys of the bindings of `call` that bind an array parameter (an explicit
+# one or an implicit one, `_TPL_FREE`), the lanes and outputs of a laned call
+# left out. Empty for a reference read through its view.
+function _tpl_array_param_keys(tt::_TplTable, call::OpExpr)
+    keys_ = String[]
+    call.bindings === nothing && return keys_
+    info = _tpl_call_info(tt, call.name)
+    info === nothing && return keys_
+    for k in keys(call.bindings)
+        (startswith(k, _TPL_OUT) || startswith(k, _TPL_LANE)) && continue
+        ((startswith(k, _TPL_FREE) ? k : _TPL_ARG * k) in info.arrays) && push!(keys_, k)
+    end
+    return keys_
+end
+
+# The extents of a computed array (`makearray` or array `faq`), each axis
+# `[1, n]` (an array index starts at 1), as a list of `n`; `nothing` when one is
+# not a build-time integer or an axis does not start at 1.
+function _argarr_extents(tt::_TplTable, v::OpExpr)
+    if v.op == "makearray"
+        regs = v.regions
+        (regs === nothing || isempty(regs)) && return nothing
+        nd = length(regs[1])
+        hi = zeros(Int, nd)
+        for r in regs
+            length(r) == nd || return nothing
+            for d in 1:nd
+                b = r[d]
+                (length(b) == 2 && b[1] isa Integer && b[2] isa Integer) || return nothing
+                b[1] >= 1 || return nothing
+                b[2] >= b[1] - 1 || return nothing
+                hi[d] = max(hi[d], b[2])
+            end
+        end
+        return hi
+    end
+    (_is_faq_op(v.op) && v.output_idx !== nothing && v.ranges !== nothing) || return nothing
+    n = Int[]
+    for o in v.output_idx
+        r = get(v.ranges, String(o), nothing)
+        r === nothing && (r = get(v.ranges, Symbol(o), nothing))
+        if r isa IndexSetRef
+            e = _tpl_iset_extent(tt, r)
+            e === nothing && return nothing
+            push!(n, e)
+        elseif r isa AbstractVector && length(r) == 2 && r[1] == 1 && r[2] isa Integer
+            push!(n, Int(r[2]))
+        else
+            return nothing
+        end
+    end
+    return n
 end
 
 """
@@ -1476,7 +1574,8 @@ function _tpl_compiles(tt::_TplTable, call::OpExpr)
         v === nothing && !(s in info.scalars || s in info.arrays || s in info.fixed) && continue
         v === nothing && return false
         if s in info.arrays
-            _tpl_array_binding(v) || _tpl_array_expr(v, tt) || return false
+            _tpl_array_binding(v) || _tpl_array_expr(v, tt) || _tpl_buffered_array_expr(v, tt) ||
+                return false
             continue
         end
         if s in info.fixed
@@ -1486,11 +1585,12 @@ function _tpl_compiles(tt::_TplTable, call::OpExpr)
         # A parameter the body never reads: its binding is never made.
         s in info.scalars || continue
         # A binding that reads a name the body binds (a reduction index the
-        # body runs, which the expansion would capture) is compiled into the
-        # instance, read where the body binds the name.
-        B = _tpl_body_binders(tt, call.name)
+        # body runs, or one a body it references binds, which the expansion
+        # would capture) is compiled into the instance, read where that body
+        # binds the name. A template call in it stays a call there.
+        B = _tpl_capture_names(tt, call.name)
         if !isempty(B) && _tpl_reads_any(v, B)
-            _tpl_inlinable(v) || return false
+            _tpl_inlinable(v, tt) || return false
             continue
         end
         s in info.uncond && continue
@@ -1508,7 +1608,8 @@ function _tpl_compiles(tt::_TplTable, call::OpExpr)
     for s in info.arrays
         startswith(s, _TPL_FREE) || continue
         v = get(b, s, nothing)
-        v === nothing || _tpl_array_binding(v) || _tpl_array_expr(v, tt) || return false
+        v === nothing || _tpl_array_binding(v) || _tpl_array_expr(v, tt) ||
+            _tpl_buffered_array_expr(v, tt) || return false
     end
     return true
 end
@@ -1590,6 +1691,43 @@ function _tpl_body_binders(tt::_TplTable, name)
         walk(b)
         out
     end
+end
+
+# The names a binding of a reference to `name` is CAPTURED by: those the
+# template's prepared body binds (`_tpl_body_binders`), and through every
+# reference in that body, the names the referenced template captures in turn,
+# with the output indices of an array-valued one. The expansion substitutes a
+# binding into the body, and a body passes it on into the bodies it
+# references, so a name any of those binds is the binder's there, not the
+# caller's (EarthSciAST Rust `captured_symbols`: the binders of the instance
+# body and of every body it reaches). The library's narrow phase
+# (`A_ij(i = i)` around `pairs(area = area_ij(i = i))`, whose `faq` binds
+# `i`) reads its loop symbols this way.
+function _tpl_capture_names(tt::_TplTable, name)
+    memo = _tpl_memo(tt, nothing, :capture_names, () -> Dict{String, Set{String}}())
+    got = get(memo, String(name), nothing)
+    got === nothing || return got
+    # The template graph is acyclic (esm-spec §9.7.3); the placeholder only
+    # keeps a malformed registry from recursing forever.
+    memo[String(name)] = Set{String}()
+    out = copy(_tpl_body_binders(tt, name))
+    def = _tpl_def(tt, name)
+    if def.closed !== nothing
+        seen = IdDict{OpExpr, Nothing}()
+        function walk(e)
+            e isa OpExpr || return
+            haskey(seen, e) && return
+            seen[e] = nothing
+            if _tpl_is_call(e) && e.name isa AbstractString
+                union!(out, _tpl_capture_names(tt, e.name))
+                info = _tpl_call_info(tt, e.name)
+                info === nothing || union!(out, info.outs)
+            end
+            return foreach_child(walk, e)
+        end
+        walk(def.closed.body)
+    end
+    return memo[String(name)] = out
 end
 
 # Does `e` read (as a variable leaf) any of the names `B`?

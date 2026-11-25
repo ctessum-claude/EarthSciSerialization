@@ -436,7 +436,13 @@ function _call_target(ct::_CallTable, call::OpExpr)
     ibody = _call_ibody(ct.tt, def, S, outs)
     # Each read the caller makes is the argument `"\0lane\0k"`.
     hp === nothing || (ibody = hp.body)
-    isempty(inl) || (ibody = _tpl_subst_scoped(ibody, inl, IdDict{OpExpr, ASTExpr}()))
+    if !isempty(inl)
+        ibody = _tpl_subst_scoped(ibody, inl, IdDict{OpExpr, ASTExpr}())
+        # A captured name an element call in the body binds as an output
+        # index is that call's subscript (`_call_capture_subscripts`).
+        cap = _call_captured_reads(ct.tt, def.name, inl)
+        isempty(cap) || (ibody = _call_capture_subscripts(ct.tt, ibody, cap, IdDict{OpExpr, ASTExpr}()))
+    end
     isempty(ainl) || (ibody = _call_subst_arrays(ibody, _call_array_skels(ainl), IdDict{OpExpr, ASTExpr}()))
     arrslots = sort!(collect(keys(arrkind)))
     # Scalar slots: the argument sentinels in the order the body first reads
@@ -827,7 +833,7 @@ function _call_inl_mode(tt::_TplTable, info::_TplCallInfo, def::_TplDef, p::Stri
     sn = _TPL_ARG * p
     (sn in info.arrays || sn in info.fixed || !(sn in info.scalars)) && return :none
     _inl_is_marked(v) && return :marked
-    B = _tpl_body_binders(tt, def.name)
+    B = _tpl_capture_names(tt, def.name)
     rb = !isempty(B) && _tpl_reads_any(v, B)
     if !rb
         sn in info.uncond && return :none
@@ -838,9 +844,8 @@ function _call_inl_mode(tt::_TplTable, info::_TplCallInfo, def::_TplDef, p::Stri
         # range only on a branch the body does not take is never read.
         _tpl_value_leaf(v) && return :none
     end
-    # A template call in a binding that reads a name the body binds is not
-    # compiled in (`_tpl_compiles` refuses it).
-    _tpl_inlinable(v, rb ? nothing : tt) || return :none
+    # A template call in a binding stays a call inside the instance.
+    _tpl_inlinable(v, tt) || return :none
     return (rb || _inl_has_index(v)) ? :marked : :plain
 end
 
@@ -920,6 +925,68 @@ function _inl_mkey(v::ASTExpr)
         return string("(call ", v.name, " ", join((string(repr(k), "=", _inl_mkey(b[k])) for k in sort!(collect(keys(b)))), " "), ")")
     end
     return string("(", v.op, " ", join((_inl_mkey(x) for x in v.args), " "), ")")
+end
+
+# ---- Captured names ---------------------------------------------------------------
+# A binding compiled into the instance keeps each name a body binds as a name
+# (`_inl_mark`): the expansion substitutes the binding into the body, where
+# that name is the binder's. A body reached through a reference binds it there
+# too (frames.jl `_tpl_capture_names`): the name stays in the binding of that
+# reference inside the instance, and the reference's own call compiles it in
+# again, down to the body that binds it. Where that is an element call, whose
+# output index is no binder of its element body but an argument
+# (`"\0out\0o"`), the captured name is read as the call's subscript for
+# that output, which is the value the expansion's loop gives it there.
+
+# The captured names the compiled-in bindings `inl` of a reference to `name`
+# read.
+function _call_captured_reads(tt::_TplTable, name::String, inl::Dict{String, ASTExpr})
+    B = _tpl_capture_names(tt, name)
+    out = Set{String}()
+    isempty(B) && return out
+    for (_, v) in inl
+        foreach_subexpr(v) do x
+            x isa VarExpr && x.name in B && push!(out, x.name)
+        end
+        v isa VarExpr && v.name in B && push!(out, v.name)
+    end
+    return out
+end
+
+# `e` with each read of a captured name `c` (of `cap`) in a binding of an
+# element call whose template has `c` as an output index replaced by the
+# call's subscript for it. A node that binds `c` itself scopes it.
+function _call_capture_subscripts(tt::_TplTable, e::ASTExpr, cap::Set{String}, memo::IdDict{OpExpr, ASTExpr})
+    e isa OpExpr || return e
+    r = get(memo, e, nothing)
+    r === nothing || return r
+    bound = intersect(cap, _bound_symbols(e))
+    inner = isempty(bound) ? cap : setdiff(cap, bound)
+    if isempty(inner)
+        r = e
+    elseif _tpl_is_call(e) && _tpl_is_elem(e)
+        info = _tpl_call_info(tt, e.name)
+        b = e.bindings::AbstractDict
+        m = Dict{String, ASTExpr}()
+        if info !== nothing
+            for o in info.outs
+                o in inner && (m[o] = b[_TPL_OUT * o])
+            end
+        end
+        rest = isempty(m) ? inner : setdiff(inner, keys(m))
+        nb = Dict{String, ASTExpr}()
+        for (k, v) in b
+            x = startswith(k, _TPL_OUT) || isempty(m) ? v : _tpl_subst_scoped(v, m, IdDict{OpExpr, ASTExpr}())
+            nb[k] = isempty(rest) ? x : _call_capture_subscripts(tt, x, rest, IdDict{OpExpr, ASTExpr}())
+        end
+        r = reconstruct(e; bindings = nb)
+    else
+        # The memo is per set of names in scope.
+        mm = inner === cap ? memo : IdDict{OpExpr, ASTExpr}()
+        r = map_children(c -> _call_capture_subscripts(tt, c, inner, mm), e)
+    end
+    memo[e] = r
+    return r
 end
 
 # ---- Array expressions compiled into the instance -------------------------------
@@ -1005,7 +1072,7 @@ function _call_mark_inlined(leaf, arr, tt::_TplTable, call::OpExpr)
     (info === nothing || call.bindings === nothing) && return call
     def = _tpl_def(tt, call.name)
     def.closed === nothing && return call
-    B = _tpl_body_binders(tt, call.name)
+    B = _tpl_capture_names(tt, call.name)
     nb = nothing
     for p in def.params
         v = get(call.bindings, p, nothing)
@@ -2056,21 +2123,49 @@ end
 # or through its view); otherwise the build is refused, naming the template and
 # why. With `ENV["ESS_TPL_SURVEY"]` naming a file, each refusal is also appended
 # to it (a diagnostic: the target is none).
+#
+# A computed array bound to an array parameter (`_tpl_buffered_binding`)
+# becomes an equation of its own (`_hoist_array_arguments`), so the references
+# in it must compile too, and it is accepted only where that pass reaches: the
+# right-hand side of one of the model's own equations.
 function _tpl_refuse_uncompiled(tt::_TplTable, model)
-    foreach_expression(model) do e, _, _
-        _tpl_refuse_walk(tt, e)
+    foreach_expression(model) do e, p, kind
+        buffered_ok = kind === :equation_rhs && startswith(p, "/equations/")
+        _tpl_refuse_walk(tt, e, buffered_ok, p)
         nothing
     end
     return nothing
 end
-function _tpl_refuse_walk(tt::_TplTable, e)
+function _tpl_refuse_walk(tt::_TplTable, e, buffered_ok::Bool, at::AbstractString)
     e isa OpExpr || return
     if _tpl_is_call(e)
         _tpl_compiles(tt, e) || throw(_tpl_refusal_error(tt, e))
+        for k in _tpl_array_param_keys(tt, e)
+            b = e.bindings[k]
+            _tpl_buffered_binding(b, tt) || continue
+            buffered_ok || throw(
+                _tpl_argarr_error(
+                    e, k, "outside the right-hand side of one of the model's own " *
+                        "equations (at $at); bind it to a named array observed instead"
+                )
+            )
+            _tpl_refuse_walk(tt, b, buffered_ok, at)
+        end
         return
     end
-    foreach_child(c -> _tpl_refuse_walk(tt, c), e)
+    foreach_child(c -> _tpl_refuse_walk(tt, c, buffered_ok, at), e)
     return
+end
+
+# The refusal of the computed array bound to the parameter `k` of `call`.
+function _tpl_argarr_error(call::OpExpr, k::AbstractString, why::AbstractString)
+    name = replace(String(call.name), '\0' => '·')
+    p = replace(String(k), '\0' => '·')
+    return TreeWalkError(
+        "E_TREEWALK_UNSUPPORTED_OP",
+        "template reference '$name' cannot be compiled as a call: array parameter " *
+            "'$p' is bound to a computed array $why"
+    )
 end
 
 function _tpl_refusal_error(tt::_TplTable, call::OpExpr)
@@ -2165,4 +2260,120 @@ function _tpl_refusal(tt::_TplTable, call::OpExpr)
         push!(bad, "$p:$kind=$vop")
     end
     return "binding: " * join(bad, " ")
+end
+
+# ---- Computed array arguments ------------------------------------------------------
+# A reference whose array parameter is bound to a computed array (a
+# `makearray`, or a `faq` the build does not read element by element:
+# frames.jl `_tpl_buffered_binding`) passes that array the way it passes a
+# named one. The array is an internal array observed of the build's own copy of
+# the model — defined by the binding, evaluated once per call of the
+# right-hand side in the caller, before its reader — and the binding names it.
+# The reference stays a call; neither it nor the array's own references are
+# expanded. This is what the native tapes do with such an argument (EarthSciAST
+# Rust: the argument is lowered in the caller and passed by reference).
+#
+# The internal observed carries the hoisted-name prefix (hoist.jl), so it is
+# kept out of observed listings and outputs, and it is materialized under
+# every compiler (build_pipeline.jl), since a call reads it as an array. Its
+# axes are internal interval index sets of the array's extents; a computed
+# array is anonymous (esm-spec §4.3.4), so it is read only through `index`,
+# positionally. Identical bindings in one equation share one array; each
+# equation has its own, filed under the variable it defines (`_hoist_owner`),
+# so a diagnostic about the array names the equation that reads it. Only the
+# model's own equations are walked: the refusal pass (`_tpl_refuse_uncompiled`)
+# refuses such a binding anywhere else.
+const _ARGARR_KIND = "argarr"
+_is_argarr_name(n::AbstractString) = occursin(string(_HOIST_PREFIX, _ARGARR_KIND), n)
+
+"""
+    _hoist_array_arguments(model, index_sets, tt) -> (model, index_sets)
+
+Every computed array bound to an array parameter of a reference in an
+equation of `model` made an internal array observed, and the binding its name
+(see the section comment above). Returns `model` and `index_sets` unchanged when
+there is none; otherwise new ones (the caller's are not mutated).
+"""
+function _hoist_array_arguments(model::Model, index_sets::AbstractDict, tt::_TplTable)
+    # (binding, owner, name) of every array made so far.
+    made = Tuple{OpExpr, String, String}[]
+    vars = OrderedDict{String, ModelVariable}()
+    eqs_new = Equation[]
+    isets_new = Dict{String, IndexSet}()
+    function hoist(v::OpExpr, owner::String, call::OpExpr, key::String)
+        for (b, o, n) in made
+            o == owner && _expr_equal(b, v) && return VarExpr(n)
+        end
+        # Read as an equation's right-hand side is read after preparation: an
+        # array-valued reference in it through its view (`_tpl_whole_views`).
+        vv = _tpl_whole_views(tt, v)
+        ext = vv isa OpExpr ? _argarr_extents(tt, vv) : nothing
+        ext === nothing && throw(
+            _tpl_argarr_error(
+                call, key, "whose extents are not build-time integers, each axis " *
+                    "starting at 1"
+            )
+        )
+        # The number is taken before the array's own expression is walked, so
+        # an array that expression binds gets a number of its own.
+        k = length(made) + 1
+        name = string(_HOIST_PREFIX, _ARGARR_KIND, k, '\0', owner)
+        push!(made, (v, owner, name))
+        shape = String[]
+        for (d, n) in enumerate(ext)
+            s = string(_HOIST_PREFIX, _ARGARR_KIND, k, '\0', "d", d)
+            isets_new[s] = IndexSet("interval"; size = n)
+            push!(shape, s)
+        end
+        vars[name] = ModelVariable(UnknownVariable; shape = shape)
+        # The array's own expression may bind computed arrays too.
+        push!(eqs_new, Equation(VarExpr(name), walk(vv, owner)))
+        return VarExpr(name)
+    end
+    seen = IdDict{Tuple{OpExpr, String}, ASTExpr}()
+    function walk(e, owner::String)
+        e isa OpExpr || return e
+        r = get(seen, (e, owner), nothing)
+        r === nothing || return r
+        r = walk_node(e, owner)
+        seen[(e, owner)] = r
+        return r
+    end
+    function walk_node(e::OpExpr, owner::String)
+        o = map_children(c -> walk(c, owner), e)
+        _tpl_is_call(o) || return o
+        # Every array parameter, also one a laned call reads through its lanes
+        # (`_call_array_slots` leaves those out): the lanes read the binding
+        # at their subscripts, so they read the hoisted array instead.
+        hoisted = Tuple{OpExpr, VarExpr}[]
+        for k in _tpl_array_param_keys(tt, o)
+            b = o.bindings[k]
+            _tpl_buffered_binding(b, tt) || continue
+            push!(hoisted, (b::OpExpr, hoist(b::OpExpr, owner, o, k)))
+        end
+        isempty(hoisted) && return o
+        function swap(x)
+            x isa OpExpr || return x
+            for (b, r) in hoisted
+                (x === b || (x.op == b.op && _expr_equal(x, b))) && return r
+            end
+            return map_children(swap, x)
+        end
+        nb = Dict{String, ASTExpr}(k => swap(v) for (k, v) in o.bindings)
+        return reconstruct(o; bindings = nb)
+    end
+    eqs = model.equations
+    for (i, eq) in enumerate(model.equations)
+        owner = _hoist_owner(eq.lhs)
+        rhs = walk(eq.rhs, owner)
+        rhs === eq.rhs && continue
+        eqs === model.equations && (eqs = copy(model.equations))
+        eqs[i] = Equation(eq.lhs, rhs; _comment = eq._comment)
+    end
+    isempty(made) && return model, index_sets
+    allvars = OrderedDict{String, ModelVariable}(model.variables)
+    merge!(allvars, vars)
+    isets = copy(index_sets)
+    merge!(isets, isets_new)
+    return reconstruct(model; variables = allvars, equations = vcat(eqs, eqs_new)), isets
 end
