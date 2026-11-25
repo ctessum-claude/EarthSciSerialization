@@ -78,6 +78,16 @@ end
 
 The template instances of one build or analysis against the registry `reg`:
 the prepared bodies, the frames by instance key, and the binding-key memo.
+
+The table reads a COPY of `reg` (a shallow one: the declarations are shared,
+never mutated). What it registers — a structural instance
+(`_tpl_register_instance!`), a view part (`_tpl_skel`) — is the table's own and
+never reaches the caller's registry. A validation or analysis table is built on
+a document's own registry (`file.component_templates`), and an instance left
+there would be read later as one of the document's declarations: flatten closes
+every declaration (`_tpl_explicit_free`), which makes the names an instance's
+body was substituted with into parameters again, so its instance would be a
+structural template that no build can call.
 """
 mutable struct _TplTable
     reg::Any
@@ -89,7 +99,7 @@ mutable struct _TplTable
     root_memos::Dict{Symbol, Any}
 end
 _TplTable(reg) = _TplTable(
-    reg, Dict{String, _TplDef}(), Dict{Tuple{String, String}, _TplClosed}(),
+    reg isa AbstractDict ? copy(reg) : reg, Dict{String, _TplDef}(), Dict{Tuple{String, String}, _TplClosed}(),
     Dict{String, _TplFrame}(), IdDict{Any, IdDict{ASTExpr, String}}(), Set{String}(),
     Dict{Symbol, Any}()
 )
@@ -1575,11 +1585,12 @@ function _tpl_compiles(tt::_TplTable, call::OpExpr)
         # A parameter the body never reads: its binding is never made.
         s in info.scalars || continue
         # A binding that reads a name the body binds (a reduction index the
-        # body runs, which the expansion would capture) is compiled into the
-        # instance, read where the body binds the name.
-        B = _tpl_body_binders(tt, call.name)
+        # body runs, or one a body it references binds, which the expansion
+        # would capture) is compiled into the instance, read where that body
+        # binds the name. A template call in it stays a call there.
+        B = _tpl_capture_names(tt, call.name, s)
         if !isempty(B) && _tpl_reads_any(v, B)
-            _tpl_inlinable(v) || return false
+            _tpl_inlinable(v, tt) || return false
             continue
         end
         s in info.uncond && continue
@@ -1680,6 +1691,51 @@ function _tpl_body_binders(tt::_TplTable, name)
         walk(b)
         out
     end
+end
+
+# The names the binding of the parameter sentinel `s` (`"\0arg\0p"`) of a
+# reference to `name` is CAPTURED by: those the template's prepared body binds
+# (`_tpl_body_binders`) and, where the body passes the parameter on in a
+# binding of a reference in it, the names that reference's template captures
+# that binding by in turn, with the output indices of an array-valued one. The
+# expansion substitutes a binding into the body, and the body's references
+# substitute it into theirs, so a name any of those binds there is the
+# binder's, not the caller's (the EarthSciAST Rust tape's `captured_symbols`).
+# The library's narrow phase (`A_ij(…)` with body `pairs(area = area_ij(…))`,
+# where `area_ij` reads `i` and `j` and `pairs`' loop binds them) reads its
+# loop symbols this way.
+function _tpl_capture_names(tt::_TplTable, name, s::AbstractString)
+    memo = _tpl_memo(tt, nothing, :capture_names, () -> Dict{Tuple{String, String}, Set{String}}())
+    key = (String(name), String(s))
+    got = get(memo, key, nothing)
+    got === nothing || return got
+    # The template graph is acyclic (esm-spec §9.7.3); the placeholder only
+    # keeps a malformed registry from recursing forever.
+    memo[key] = Set{String}()
+    out = copy(_tpl_body_binders(tt, name))
+    def = _tpl_def(tt, name)
+    if def.closed !== nothing
+        S = Set{String}([String(s)])
+        seen = IdDict{OpExpr, Nothing}()
+        function walk(e)
+            e isa OpExpr || return
+            haskey(seen, e) && return
+            seen[e] = nothing
+            if _tpl_is_call(e) && e.name isa AbstractString && e.bindings !== nothing
+                for (k, v) in e.bindings
+                    # A subscript is evaluated where the element call is.
+                    (startswith(k, _TPL_OUT) || startswith(k, _TPL_LANE)) && continue
+                    _tpl_reads_any(v, S) || continue
+                    union!(out, _tpl_capture_names(tt, e.name, _tpl_binding_sentinel(k)))
+                    info = _tpl_call_info(tt, e.name)
+                    info === nothing || union!(out, info.outs)
+                end
+            end
+            return foreach_child(walk, e)
+        end
+        walk(def.closed.body)
+    end
+    return memo[key] = out
 end
 
 # Does `e` read (as a variable leaf) any of the names `B`?
