@@ -1948,11 +1948,11 @@ end
 # then the `seed_ic!` hook. Always a fresh vector — the build's `u0` is never
 # mutated, so `remake(prob; u0 = …)` cannot disturb the problem it came from.
 # esm-spec §11.4: an unknown that needs a starting value and has none — no
-# `default`, no initial condition, no `ic` equation, no caller `u0` — is an
-# error when the problem is built. The build reports the slots it could not
-# seed (`BuildProducts.unvalued_slots`, holding a 0.0 placeholder); a caller
-# `u0` that names them, a whole replacement vector, or a `seed_ic!` hook covers
-# them.
+# `default`, no initial condition, no `ic` equation, no initialization
+# equation, no caller `u0` — is an error when the problem is built. The build
+# reports the slots it could not seed (`BuildProducts.unvalued_slots`, holding a
+# 0.0 placeholder); a caller `u0` that names them, a whole replacement vector,
+# or a `seed_ic!` hook covers them.
 function _refuse_missing_initial_values(
         unvalued::Vector{Int}, u0_built::Vector{Float64},
         var_map::AbstractDict, u0, seed_ic!
@@ -1983,8 +1983,8 @@ function _refuse_missing_initial_values(
         TreeWalkError(
             "E_TREEWALK_MISSING_INITIAL_VALUE",
             "no starting value for $(length(names)) unknown(s) ($(shown)): the unknown " *
-                "declares no `default`, and no initial condition, `ic` equation or caller " *
-                "`u0` sets it. An unknown with no starting value is an error when a problem " *
+                "declares no `default`, and no initial condition, `ic` equation, initialization " *
+                "equation or caller `u0` sets it. An unknown with no starting value is an error when a problem " *
                 "is built (esm-spec §11.4). To supply it, pass `u0 = Dict(\"$(first(names))\" " *
                 "=> value)` to `esm_problem`, or declare a `default` on the unknown."
         )

@@ -275,7 +275,7 @@ function _build_partition_and_materialize(
                     join_key_arrays, join_var_shapes, join_obs_defs
                 ),
                 _resolve_join_gates(
-                    model.initialization_equations,
+                    _lift_initialization_equations(model.initialization_equations, model),
                     index_sets, vi_maps, join_key_arrays,
                     join_var_shapes, join_obs_defs
                 ),
@@ -679,10 +679,10 @@ function _build_compile_evaluator(
         )
     end
 
-    # The faq-valued initialization equations seed `u0`. A caller's `u0` is
-    # part of the state they read, and a cell it names keeps its value.
+    # The initialization equations seed `u0`. A caller's `u0` is part of the
+    # state they read, and a slot it names keeps its value.
     caller_slots = _apply_caller_u0!(u0, layout.var_map, parts.init_equations, caller_u0)
-    seeded = _seed_faq_init_u0!(
+    seeded = _seed_init_u0!(
         u0, parts.init_equations, initial_conditions, state_scope, p;
         skip_slots = caller_slots
     )

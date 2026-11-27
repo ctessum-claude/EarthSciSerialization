@@ -54,17 +54,17 @@ _with_flat(prep::PreparedRun, flat::FlattenedSystem) =
 # survivors they were folded into (esm-libraries-spec §4.7.1 step 4).
 _merged_renames(prep::PreparedRun) = prep.flat.metadata.merged_variable_renames
 
-# An initialization equation that assigns cells: `u ~ faq(…)`, a bare-variable
-# left-hand side and an array-valued right-hand side (esm-spec §6.2).
-_is_faq_initialization(eq::Equation) =
-    eq.lhs isa VarExpr && eq.rhs isa OpExpr && _is_faq_op(eq.rhs.op) &&
-    eq.rhs.output_idx !== nothing && !isempty(eq.rhs.output_idx)
+# An initialization equation the build applies when it builds the initial state
+# (esm-spec §6.2): a bare-variable left-hand side, whatever the right-hand side.
+# `u ~ faq(…)` assigns the cells of its ranges; any other right-hand side gives
+# the whole target its value, a scalar one replicated and an array one aligned
+# by index-set name (esm-spec §4.3.4, `_lift_initialization_equations`).
+_is_applied_initialization(eq::Equation) = eq.lhs isa VarExpr
 
-# The `faq`-valued initialization equations of a flattened system, which the
-# tree-walk build seeds `u0` from (`_seed_faq_init_u0!`). The other spellings
-# name no cells for that seed to assign.
-_faq_initialization(flat::FlattenedSystem) =
-    filter(_is_faq_initialization, flat.initialization_equations)
+# The initialization equations of a flattened system that the tree-walk build
+# seeds `u0` from (`_seed_init_u0!`), in document order.
+_applied_initialization(flat::FlattenedSystem) =
+    filter(_is_applied_initialization, flat.initialization_equations)
 
 # The refusals of a construct the tree-walk build does not run (esm-spec
 # §9.6.6): an event, a Wiener-noise parameter, a parameter recomputed by its own
@@ -157,7 +157,7 @@ const _RUN_MODEL = "Flattened"
 The single-model typed document the build compiles: `flat` (by default the
 prepared system; `rhs_program` passes a selection of it) as one model named
 `"Flattened"`, with the document-scoped index sets, domain, `coordinates` and
-`solver`, and `init` (by default the `faq`-valued initialization equations) as
+`solver`, and `init` (by default every initialization equation the build applies) as
 the model's initialization equations.
 
 With `shape_transforms`, a feed-forward algebraic chain authored as scalars is
@@ -169,7 +169,7 @@ lift. A compiler that does that work itself (`:mtk`) passes `false`.
 """
 function _run_file(
         prep::PreparedRun; flat::FlattenedSystem = prep.flat,
-        init::Vector{Equation} = _faq_initialization(flat),
+        init::Vector{Equation} = _applied_initialization(flat),
         shape_transforms::Bool = true
     )::EsmFile
     shape_transforms && (flat = promote_downstream_shapes(algebraic_states_to_observeds(flat)))

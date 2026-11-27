@@ -1,5 +1,5 @@
 # tree_walk/build_initial_state.jl — the initial state: `ic` equations, their start-of-run scope and
-# plan, the scalar and field folds, `u0`, the caller's `u0`, faq-valued
+# plan, the scalar and field folds, `u0`, the caller's `u0`, the
 # initialization equations, and the re-seed a Problem keeps.
 
 # ---- Stage: split out `ic(var) = <initial value>` equations (esm-spec §11.4) ----
@@ -603,18 +603,66 @@ function _cell_default(model::Model, name::String, idxs::Vector{Int})
     return Float64(d)
 end
 
-# ---- Stage: faq-valued initialization_equations → u0 ----
-# When discretize() materializes an IC equation as a faq (coord-subst
-# x→index(coord_x,i)), the aggregate is filled through the right-hand-side
-# cascade and emitted code, once (`_init_equation_fill`, setup_fill.jl). A body
-# the fill declines — one that reads a state, say — is compiled ONCE with the
-# output indices kept symbolic — the same symbolic resolve the whole-array
-# contraction tier uses, so a const or state read at an output index becomes a
-# runtime gather — and then evaluated at each cell by setting the index
-# counters. Only a body that will not resolve symbolically takes the per-cell
-# substitute → resolve → compile, which a strict compiler refuses. The coord_<dim> const_array must be provided
-# by the caller. Explicit initial_conditions values take precedence (already
+# ---- Stage: initialization_equations → u0 ----
+# Every initialization equation with a bare-variable left-hand side (esm-spec
+# §6.2) seeds `u0`. `_lift_initialization_equations` writes each in one of two
+# forms: an array target as `u ~ faq(…)` over its cells, a scalar target as
+# `x ~ <scalar expression>`.
+#
+# A `faq`'s aggregate is filled through the right-hand-side cascade and emitted
+# code, once (`_init_equation_fill`, setup_fill.jl). A body the fill declines —
+# one that reads a state, say — is compiled ONCE with the output indices kept
+# symbolic — the same symbolic resolve the whole-array contraction tier uses, so
+# a const or state read at an output index becomes a runtime gather — and then
+# evaluated at each cell by setting the index counters. Only a body that will
+# not resolve symbolically takes the per-cell substitute → resolve → compile,
+# which a strict compiler refuses. The coord_<dim> const_array must be provided
+# by the caller. A scalar target's right-hand side is compiled once and
+# evaluated once. Explicit initial_conditions values take precedence (already
 # seeded in u0).
+
+# The initialization equations `eqs` of `model` in the form the seed evaluates
+# (esm-spec §6.2). An equation whose left-hand side is not a bare variable is not
+# one the build applies and is dropped here. `u ~ faq(…)` with output indices
+# stays as written. Any other right-hand side of a target declared with an array
+# `shape` denotes the `faq` over that shape (`_lift_to_faq`): each array operand
+# read at the cell, aligned by index-set NAME, so a lower-rank operand repeats
+# along the axes it does not declare and a name-permuted one transposes
+# (esm-spec §4.3.4); a scalar right-hand side is the same `faq` with no array
+# operand, its value given to every cell. A scalar target keeps its right-hand
+# side. The equations are unchanged (the same vector) when nothing needs lifting.
+function _lift_initialization_equations(eqs::Vector{Equation}, model::Model)
+    needs(eq) = eq.lhs isa VarExpr && !_is_cell_assigning_faq(eq.rhs) &&
+        _is_array_shape(_declared_shape(model, (eq.lhs::VarExpr).name))
+    all(eq -> eq.lhs isa VarExpr && !needs(eq), eqs) && return eqs
+    var_shapes = Dict{String, Vector{String}}()
+    for (n, v) in model.variables
+        v.shape === nothing && continue
+        var_shapes[n] = String[String(s) for s in v.shape]
+    end
+    arrayvars = Set{String}(n for (n, v) in model.variables if _is_array_shape(v.shape))
+    out = Equation[]
+    for eq in eqs
+        eq.lhs isa VarExpr || continue
+        if needs(eq)
+            shape = var_shapes[(eq.lhs::VarExpr).name]
+            rhs = _lift_to_faq(eq.rhs, shape, arrayvars, var_shapes)
+            push!(out, Equation(eq.lhs, rhs; _comment = eq._comment))
+        else
+            push!(out, eq)
+        end
+    end
+    return out
+end
+
+_declared_shape(model::Model, name::String) =
+    (v = get(model.variables, name, nothing); v === nothing ? nothing : v.shape)
+
+# `u ~ faq(…)` with output indices: the right-hand side names the cells it sets.
+_is_cell_assigning_faq(rhs) =
+    rhs isa OpExpr && _is_faq_op((rhs::OpExpr).op) &&
+    !isempty(_output_idx_strings(rhs::OpExpr))
+
 # Write the caller's u0 override `cu` (`esm_problem`'s `u0`, `BuildOptions`
 # `caller_u0`) into `u0` before the initialization equations run, and return the
 # slots it names (they keep the caller's value): an initialization equation
@@ -641,12 +689,12 @@ function _apply_caller_u0!(u0::Vector{Float64}, var_map, init_equations, cu)
     return slots
 end
 
-# Each `faq`-valued initialization equation (esm-spec §6.2) evaluated into the
-# cells of `u0` it sets, against the state-only scope `cs`. A cell an explicit
-# initial condition or the caller's `u0` names (`skip_slots`) keeps its value.
-# Returns the slots the equations set: each now has a starting value
-# (esm-spec §11.4).
-function _seed_faq_init_u0!(
+# Each initialization equation (esm-spec §6.2), in the forms
+# `_lift_initialization_equations` writes, evaluated into the slots of `u0` it
+# sets, in order, against the state-only scope `cs`. A slot an explicit initial
+# condition or the caller's `u0` names (`skip_slots`) keeps its value. Returns
+# the slots the equations set: each now has a starting value (esm-spec §11.4).
+function _seed_init_u0!(
         u0::Vector{Float64}, init_equations::Vector{Equation},
         initial_conditions::AbstractDict, cs::_CompileScope, p::Union{Nothing, NamedTuple};
         skip_slots::Set{Int} = Set{Int}()
@@ -656,8 +704,18 @@ function _seed_faq_init_u0!(
     pp = isnothing(p) ? NamedTuple() : p
     for eq in init_equations
         eq.lhs isa VarExpr || continue
-        eq.rhs isa OpExpr && _is_faq_op((eq.rhs::OpExpr).op) || continue
         var_name = (eq.lhs::VarExpr).name
+        if !_is_cell_assigning_faq(eq.rhs)
+            # A scalar target: its right-hand side compiled once and evaluated
+            # once, which no compiler refuses (esm-libraries-spec §2.5.10).
+            haskey(initial_conditions, var_name) && continue
+            slot = get(var_map, var_name, 0)
+            (slot == 0 || slot in skip_slots) && continue
+            _record_rule!("init($(var_name))", :equation, :setup_compiled)
+            u0[slot] = _eval_node(_compile_in(cs, _resolve_in(cs, eq.rhs)), u0, pp, 0.0)
+            push!(seeded, slot)
+            continue
+        end
         rhs_op = eq.rhs::OpExpr
         idx_names = _output_idx_strings(rhs_op)
         ranges_dict = _ranges_dict(rhs_op)

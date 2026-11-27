@@ -605,15 +605,15 @@ pub struct FlattenedSystem {
     /// equations, so the ordinary ODE path is unaffected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_ics: Vec<(String, Expr)>,
-    /// The `faq`-valued initialization equations (esm-spec §6.2, equations
-    /// that hold at t = 0) of every component and subsystem, as ordered,
-    /// namespaced `(target_state, faq)` pairs ([`initialization_faq`]). Each
-    /// assigns the cells of its ranges when the initial state is built. The
-    /// other spellings of an initialization equation name no cells and are
-    /// not carried. Empty (and omitted when serialized) for a system with
-    /// none.
+    /// Every component's and subsystem's `initialization_equations`
+    /// (esm-spec §6.2, equations that hold at t = 0), in document order,
+    /// named as `equations` are (esm-libraries-spec §4.7.5 step 4): namespaced
+    /// in the component's scope, then rewritten by the coupling substitutions.
+    /// The build applies each one with a bare-variable left-hand side when it
+    /// builds the initial state ([`initialization_target`]). Empty (and
+    /// omitted when serialized) for a system with none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub initialization_faqs: Vec<(String, Expr)>,
+    pub initialization_equations: Vec<Equation>,
     /// Flattened equations in processing order. Every variable reference is
     /// dot-namespaced.
     pub equations: Vec<Equation>,
@@ -1100,7 +1100,7 @@ fn flatten_impl(file: &EsmFile) -> Result<FlattenedSystem, FlattenError> {
         parameters,
         observed_variables,
         field_ics,
-        initialization_faqs,
+        initialization_equations,
         equations,
         continuous_events,
         discrete_events,
@@ -1139,7 +1139,7 @@ fn flatten_impl(file: &EsmFile) -> Result<FlattenedSystem, FlattenError> {
         brownian_parameters,
         discrete_parameters,
         field_ics,
-        initialization_faqs,
+        initialization_equations,
         equations,
         equation_contributions,
         equation_lifted,
@@ -2520,7 +2520,7 @@ struct AssembledParts {
     parameters: IndexMap<String, ModelVariable>,
     observed_variables: IndexMap<String, ModelVariable>,
     field_ics: Vec<(String, Expr)>,
-    initialization_faqs: Vec<(String, Expr)>,
+    initialization_equations: Vec<Equation>,
     equations: Vec<FlatEq>,
     continuous_events: Vec<ContinuousEvent>,
     discrete_events: Vec<DiscreteEvent>,
@@ -2540,11 +2540,11 @@ impl AssembledParts {
                 fe.map_contributions(&mut *f);
             }
         }
-        for (_, e) in self
-            .initialization_faqs
-            .iter_mut()
-            .chain(self.field_ics.iter_mut())
-        {
+        for eq in &mut self.initialization_equations {
+            eq.lhs = f(&eq.lhs);
+            eq.rhs = f(&eq.rhs);
+        }
+        for (_, e) in &mut self.field_ics {
             *e = f(e);
         }
         fn affects(a: &mut [AffectEquation], f: &mut dyn FnMut(&Expr) -> Expr) {
@@ -2592,7 +2592,7 @@ fn assemble_output(per_system: Vec<SystemBlock>) -> AssembledParts {
         parameters: IndexMap::new(),
         observed_variables: IndexMap::new(),
         field_ics: Vec::new(),
-        initialization_faqs: Vec::new(),
+        initialization_equations: Vec::new(),
         equations: Vec::new(),
         continuous_events: Vec::new(),
         discrete_events: Vec::new(),
@@ -2610,7 +2610,8 @@ fn assemble_output(per_system: Vec<SystemBlock>) -> AssembledParts {
             parts.observed_variables.insert(name, var);
         }
         parts.equations.extend(block.equations);
-        parts.initialization_faqs.extend(block.initialization_faqs);
+        parts.initialization_equations
+            .extend(block.initialization_equations);
         parts.continuous_events.extend(block.continuous_events);
         parts.discrete_events.extend(block.discrete_events);
     }
@@ -3263,27 +3264,31 @@ struct SystemBlock {
     /// block an equation sits in is its slot owner (§4.7.1 step 4), not its
     /// provenance: a reattributed equation moves here with its list.
     equations: Vec<FlatEq>,
-    /// The component's `faq`-valued initialization equations, namespaced.
-    initialization_faqs: Vec<(String, Expr)>,
+    /// The component's initialization equations, namespaced.
+    initialization_equations: Vec<Equation>,
     continuous_events: Vec<ContinuousEvent>,
     discrete_events: Vec<DiscreteEvent>,
 }
 
-/// The `faq`-valued initialization equation `eq` as `(target, faq)` (esm-spec
-/// §6.2): `u ~ faq(…)` with a bare-variable left-hand side and an array-valued
-/// right-hand side. Each assigns the cells of its ranges when the initial
-/// state is built; the other spellings name no cells to assign and are not
-/// evaluated, as in the Julia reference's `_seed_faq_init_u0!`.
-pub(crate) fn initialization_faq(eq: &Equation) -> Option<(&str, &Expr)> {
-    match (&eq.lhs, &eq.rhs) {
-        (Expr::Variable(target), Expr::Operator(node))
-            if crate::faq::is_faq_op(&node.op)
-                && node.output_idx.as_ref().is_some_and(|o| !o.is_empty()) =>
-        {
-            Some((target.as_str(), &eq.rhs))
-        }
+/// The target of an initialization equation the build applies (esm-spec
+/// §6.2): the variable a bare-variable left-hand side names. `u ~ faq(…)`
+/// assigns the cells of its ranges; any other right-hand side gives the whole
+/// target its value, a scalar one replicated over an array target and an
+/// array one aligned by index-set name (esm-spec §4.3.4). `None` for any other
+/// left-hand side, which names no target to assign.
+pub(crate) fn initialization_target(eq: &Equation) -> Option<&str> {
+    match &eq.lhs {
+        Expr::Variable(target) => Some(target.as_str()),
         _ => None,
     }
+}
+
+/// Whether `rhs` is a `faq` with output indices: an initialization equation
+/// `u ~ faq(…)` that assigns the cells of its ranges.
+pub(crate) fn is_cell_assigning_faq(rhs: &Expr) -> bool {
+    matches!(rhs, Expr::Operator(node)
+        if crate::faq::is_faq_op(&node.op)
+            && node.output_idx.as_ref().is_some_and(|o| !o.is_empty()))
 }
 
 fn build_model_block(
@@ -3414,16 +3419,16 @@ fn build_model_block(
         .map(|e| namespace_discrete_event(e, system_name, &sub_keys, &locals, refs))
         .collect();
 
-    // The `faq`-valued initialization equations, namespaced in the same
-    // scope as the equations.
-    let initialization_faqs = model
+    // The initialization equations, namespaced in the same scope as the
+    // equations.
+    let initialization_equations = model
         .initialization_equations
         .iter()
         .flatten()
-        .filter(|eq| initialization_faq(eq).is_some())
-        .map(|eq| match ns.expr(&eq.lhs) {
-            Expr::Variable(target) => (target, ns.expr(&eq.rhs)),
-            _ => unreachable!("an initialization faq's left-hand side is a variable"),
+        .map(|eq| Equation {
+            lhs: ns.expr(&eq.lhs),
+            rhs: ns.expr(&eq.rhs),
+            comment: eq.comment.clone(),
         })
         .collect();
 
@@ -3433,7 +3438,7 @@ fn build_model_block(
         parameters,
         observed_vars,
         equations,
-        initialization_faqs,
+        initialization_equations,
         continuous_events,
         discrete_events,
     };
@@ -3465,8 +3470,8 @@ fn build_model_block(
         block.observed_vars.extend(sub_block.observed_vars);
         block.equations.extend(sub_block.equations);
         block
-            .initialization_faqs
-            .extend(sub_block.initialization_faqs);
+            .initialization_equations
+            .extend(sub_block.initialization_equations);
     }
 
     Ok(block)
@@ -3587,7 +3592,7 @@ fn build_reaction_block(
         parameters,
         observed_vars: IndexMap::new(),
         equations,
-        initialization_faqs: Vec::new(),
+        initialization_equations: Vec::new(),
         continuous_events,
         discrete_events,
     })
@@ -5207,7 +5212,7 @@ fn apply_couple(
             parameters: IndexMap::new(),
             observed_vars: IndexMap::new(),
             equations: new_equations,
-            initialization_faqs: Vec::new(),
+            initialization_equations: Vec::new(),
             continuous_events: Vec::new(),
             discrete_events: Vec::new(),
         });

@@ -120,7 +120,8 @@ pub(super) fn missing_data_error(
 }
 
 /// The `E_TREEWALK_MISSING_INITIAL_VALUE` refusal: a state slot no default,
-/// initial condition, `ic` equation or caller `u0` gives a starting value.
+/// initial condition, `ic` equation, initialization equation or caller `u0`
+/// gives a starting value.
 #[cfg(feature = "solve")]
 pub(super) fn refuse_missing_initial_values(
     c: &ArrayCompiled,
@@ -139,8 +140,9 @@ pub(super) fn refuse_missing_initial_values(
             slot: first.clone(),
             detail: format!(
                 "no starting value for {} unknown(s) ({}): the unknown declares no `default`, \
-                 and no initial condition, `ic` equation or caller `u0` sets it. An unknown with \
-                 no starting value is an error when a problem is built (esm-spec §11.4). To \
+                 and no initial condition, `ic` equation, initialization equation or caller \
+                 `u0` sets it. An unknown with no starting value is an error when a problem is \
+                 built (esm-spec §11.4). To \
                  supply it, pass it in `ProblemOptions::u0` under \"{first}\", or declare a \
                  `default` on the unknown.",
                 unset.len(),

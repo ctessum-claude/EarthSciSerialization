@@ -158,15 +158,15 @@ function _mtk_refuse_unsupported_file(file::EarthSciAST.EsmFile, _strip_taken)
     return nothing
 end
 
-# A `faq`-valued initialization equation (esm-spec §6.2) seeds the cells of an
-# array state; this compiler takes initial values from defaults and `ic`
-# equations only.
-function _mtk_refuse_faq_initialization(flat::FlattenedSystem)
-    init = EarthSciAST._faq_initialization(flat)
+# An initialization equation (esm-spec §6.2) gives its target a starting value;
+# this compiler takes initial values from defaults and `ic` equations only, so it
+# refuses one rather than start the target from its default.
+function _mtk_refuse_initialization(flat::FlattenedSystem)
+    init = EarthSciAST._applied_initialization(flat)
     isempty(init) || _mtk_refuse(
         _mtk_equation_label(first(init)),
-        "it is a `faq`-valued initialization equation, which this compiler has no " *
-            "lowering for: it would start the array from its default instead. " *
+        "it is an initialization equation, which this compiler has no lowering " *
+            "for: it would start its target from its default instead. " *
             _MTK_TRY_INSTEAD
     )
     return nothing
@@ -783,7 +783,7 @@ function _mtk_problem_impl(input, req::EarthSciAST._ProblemRequest)
     span = req.span
     prep = EarthSciAST._prepare_run(
         input; metaparameters = req.metaparameters, base_path = req.base_path,
-        refuse_file = _mtk_refuse_unsupported_file, refuse_flat = _mtk_refuse_faq_initialization
+        refuse_file = _mtk_refuse_unsupported_file, refuse_flat = _mtk_refuse_initialization
     )
     flat = prep.flat
     EarthSciAST._refuse_parameter_definitions(

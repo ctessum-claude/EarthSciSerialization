@@ -187,7 +187,7 @@ end
 #     compile is refused by the cascade, naming it.
 #   * PER CELL (`interpreter`, the oracle): every cell is resolved and compiled
 #     as `index(<def>, j…)` and walked with `_eval_node` at each refill —
-#     the `_seed_faq_init_u0!` pattern, writing a cache buffer instead of a u0
+#     the `_seed_init_u0!` pattern, writing a cache buffer instead of a u0
 #     slot. Reported `:discrete_percell`, and refused by a strict plan.
 #
 # A fill may read scalar parameters, so the caches belong to the `p` they were

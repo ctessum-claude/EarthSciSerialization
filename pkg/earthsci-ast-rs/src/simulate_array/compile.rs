@@ -183,19 +183,11 @@ pub(crate) fn model_from_flattened(flat: &FlattenedSystem) -> Model {
     {
         variables.insert(name.clone(), var.clone());
     }
-    // The `faq`-valued initialization equations go back into the model's own
-    // block, so every later stage resolves their ranges and joins as it does
-    // an authored model's.
-    let initialization_equations = (!flat.initialization_faqs.is_empty()).then(|| {
-        flat.initialization_faqs
-            .iter()
-            .map(|(target, rhs)| crate::types::Equation {
-                lhs: Expr::Variable(target.clone()),
-                rhs: rhs.clone(),
-                comment: None,
-            })
-            .collect()
-    });
+    // The initialization equations go back into the model's own block, so
+    // every later stage resolves their ranges and joins as it does an
+    // authored model's.
+    let initialization_equations =
+        (!flat.initialization_equations.is_empty()).then(|| flat.initialization_equations.clone());
     Model {
         variables,
         equations: flat.equations.clone(),
@@ -1035,7 +1027,7 @@ impl ArrayCompiled {
         // Classify scoped-reference / array `ic` equations (esm-spec §11.4.1)
         // out of the rule builder into `field_ics` (see [`classify_field_ics`]).
         let field_ics = classify_field_ics(model);
-        let init_faqs = classify_initialization_faqs(model);
+        let init_faqs = classify_initialization_equations(model, &array_axes, &ops)?;
 
         // (7)+(7b)+(8) Build the RHS rules, cover held-at-ic slots, and
         // validate that every state slot has a defining equation.
@@ -3381,18 +3373,92 @@ fn classify_field_ics(model: &Model) -> Vec<(String, Expr)> {
     field_ics
 }
 
-/// The `faq`-valued initialization equations (esm-spec §6.2) of an authored
-/// model, in document order ([`crate::flatten::initialization_faq`]); a
-/// flattened system carries its own
-/// ([`FlattenedSystem::initialization_faqs`]).
-fn classify_initialization_faqs(model: &Model) -> Vec<(String, Expr)> {
-    model
-        .initialization_equations
+/// The initialization equations (esm-spec §6.2) of `model` the build applies,
+/// in document order, each as `(target, rhs)` in the form
+/// [`ArrayCompiled::seed_initialization_equations`] evaluates: those with a
+/// bare-variable left-hand side ([`crate::flatten::initialization_target`]).
+///
+/// `u ~ faq(…)` with output indices stays as written. Any other right-hand
+/// side of a target with index-set axes (`array_axes`) denotes the `faq` over
+/// those axes, its array operands each read at the cell by index-set NAME
+/// ([`build_gather_plan`], [`index_array_leaves_by_loops`]): a lower-rank
+/// operand repeats along the axes it does not carry and a name-permuted one
+/// transposes (esm-spec §4.3.4), and a scalar right-hand side gives every
+/// cell its value. A scalar target keeps its right-hand side. An operand with
+/// an index set the target does not have is refused, as it is in an equation
+/// (`array_shape_mismatch`).
+fn classify_initialization_equations(
+    model: &Model,
+    array_axes: &HashMap<String, Vec<String>>,
+    ops: &Instances,
+) -> Result<Vec<(String, Expr)>, CompileError> {
+    let mut out = Vec::new();
+    for eq in model.initialization_equations.iter().flatten() {
+        let Some(target) = crate::flatten::initialization_target(eq) else {
+            continue;
+        };
+        let rhs = match array_axes.get(target) {
+            Some(axes) if !crate::flatten::is_cell_assigning_faq(&eq.rhs) => {
+                lift_initialization_rhs(target, &eq.rhs, axes, array_axes, ops)?
+            }
+            _ => eq.rhs.clone(),
+        };
+        out.push((target.to_string(), rhs));
+    }
+    Ok(out)
+}
+
+/// The whole-array right-hand side `rhs` of the initialization equation of
+/// `target`, over `axes`, as the `faq` it denotes (esm-spec §4.3.4): one output
+/// index per axis, ranging over that axis's index set, and `rhs` read at the
+/// cell.
+fn lift_initialization_rhs(
+    target: &str,
+    rhs: &Expr,
+    axes: &[String],
+    array_axes: &HashMap<String, Vec<String>>,
+    ops: &Instances,
+) -> Result<Expr, CompileError> {
+    let plan = build_gather_plan(rhs, array_axes, target, Some(axes), false)?;
+    let mut used: HashSet<String> = HashSet::new();
+    match rhs {
+        Expr::Operator(node) => names_bound_or_read(node, &mut used),
+        Expr::Variable(name) => {
+            used.insert(name.clone());
+        }
+        _ => {}
+    }
+    let loops: Vec<String> = (0..axes.len())
+        .map(|d| {
+            let mut sym = format!("_init{d}");
+            while used.contains(&sym) {
+                sym.insert(0, '_');
+            }
+            sym
+        })
+        .collect();
+    let body = index_array_leaves_by_loops(rhs, array_axes, Some(&plan), &loops, ops);
+    let ranges = loops
         .iter()
-        .flatten()
-        .filter_map(crate::flatten::initialization_faq)
-        .map(|(target, rhs)| (target.to_string(), rhs.clone()))
-        .collect()
+        .zip(axes)
+        .map(|(l, axis)| {
+            (
+                l.clone(),
+                crate::types::RangeSpec::IndexSetRef {
+                    from: axis.clone(),
+                    of: None,
+                },
+            )
+        })
+        .collect();
+    Ok(Expr::operator(ExpressionNode {
+        op: "faq".to_string(),
+        args: Vec::new(),
+        output_idx: Some(loops),
+        ranges: Some(ranges),
+        expr: Some(Box::new(body)),
+        ..Default::default()
+    }))
 }
 
 /// (7) Build the RHS rules. Each equation with a derivative LHS produces

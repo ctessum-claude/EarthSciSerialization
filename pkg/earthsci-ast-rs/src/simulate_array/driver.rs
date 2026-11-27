@@ -1383,23 +1383,24 @@ impl ArrayCompiled {
         (ic_vec, unset)
     }
 
-    /// Evaluate the `faq`-valued initialization equations (esm-spec §6.2:
-    /// equations that hold at t = 0) into `ic_vec`, in document order: each
-    /// assigns every cell of its ranges the value its body takes there, read
-    /// against the initial state seeded so far (defaults, field `ic`s, the
-    /// caller's overrides and the equations before it) and the parameters and
-    /// forcing fields, at t = 0. A cell in `keep` — one the caller's `u0`
-    /// names — keeps its value. Returns the slots assigned. The Julia
-    /// reference's `_seed_faq_init_u0!`, whose order and precedence this
-    /// follows.
+    /// Evaluate the initialization equations (esm-spec §6.2: equations that
+    /// hold at t = 0) into `ic_vec`, in document order, each in the form
+    /// `classify_initialization_equations` wrote it: `u ~ faq(…)` assigns
+    /// every cell of its ranges the value its body takes there, and a scalar
+    /// target takes its right-hand side's value. Each is read against the
+    /// initial state seeded so far (defaults, field `ic`s, the caller's
+    /// overrides and the equations before it) and the parameters and forcing
+    /// fields, at t = 0. A slot in `keep` — one the caller's `u0` names —
+    /// keeps its value. Returns the slots assigned. The Julia reference's
+    /// `_seed_init_u0!`, whose order and precedence this follows.
     ///
-    /// The whole `faq` is one build-time field evaluation, as a field `ic`'s
-    /// coordinate expression is ([`BuildEval::of_compiler`]): the interpreter
-    /// walks it cell by cell, and the other compilers lower it on a standalone
-    /// tape, refusing it when the tape declines (`records` then carries the
-    /// refusal).
+    /// Each right-hand side is one build-time field evaluation, as a field
+    /// `ic`'s coordinate expression is ([`BuildEval::of_compiler`]): the
+    /// interpreter walks it cell by cell, and the other compilers lower it on
+    /// a standalone tape, refusing it when the tape declines (`records` then
+    /// carries the refusal).
     #[cfg(feature = "solve")]
-    pub(crate) fn seed_initialization_faqs(
+    pub(crate) fn seed_initialization_equations(
         &self,
         ic_vec: &mut [f64],
         params: &HashMap<String, f64>,
@@ -1419,7 +1420,7 @@ impl ArrayCompiled {
             };
             let vs = self.var_shapes.get(target).ok_or_else(|| {
                 invalid(format!(
-                    "the left-hand side `{target}` of a `faq` initialization equation is not a \
+                    "the left-hand side `{target}` of an initialization equation is not a \
                      state variable"
                 ))
             })?;
@@ -1433,6 +1434,64 @@ impl ArrayCompiled {
             }
             for (name, arr) in self.forcing.borrow().iter() {
                 scope.entry(name.clone()).or_insert_with(|| arr.clone());
+            }
+            if !crate::flatten::is_cell_assigning_faq(rhs) {
+                // A scalar target: one value, its right-hand side's.
+                if vs.shape.iter().product::<usize>() != 1 {
+                    return Err(invalid(format!(
+                        "the right-hand side is not elementwise over the axes of `{target}`, \
+                         so it gives no value per cell"
+                    )));
+                }
+                let slot = vs.flat_offset;
+                if keep.contains(&slot) {
+                    continue;
+                }
+                let value = eval_buildtime_field_routed(
+                    None,
+                    rhs,
+                    &self.index_sets,
+                    params,
+                    &scope,
+                    mode,
+                    &self.operators,
+                );
+                let v = match value {
+                    Ok(Routed::Refused(why)) => {
+                        return refuse_field_ic(
+                            records.as_deref_mut(),
+                            &rule,
+                            "initialization equation",
+                            why,
+                        )
+                        .map(|()| assigned);
+                    }
+                    Ok(Routed::Value(v, route)) => {
+                        if let Some(sink) = records.as_deref_mut() {
+                            sink.push(FieldIcRecord {
+                                name: rule.clone(),
+                                kind: "initialization equation",
+                                route: Ok(route),
+                            });
+                        }
+                        match v {
+                            Value::Scalar(x) => x,
+                            Value::Array(a) if a.len() == 1 => a.iter().copied().next().unwrap(),
+                            Value::Array(_) => {
+                                return Err(invalid(format!(
+                                    "the right-hand side is an array, and `{target}` is a scalar"
+                                )));
+                            }
+                        }
+                    }
+                    Err(e) => return Err(invalid(e.to_string())),
+                };
+                if let Some(fault) = take_fault() {
+                    return Err(invalid(fault.message));
+                }
+                ic_vec[slot] = v;
+                assigned.push(slot);
+                continue;
             }
             let mut resolved = rhs.clone();
             crate::faq::resolve_expr_ranges(&mut resolved, &self.index_sets)
@@ -1611,7 +1670,7 @@ impl ArrayCompiled {
             // the caller's `u0` is not known yet, and only the route each one
             // takes is recorded here. `build_initial_state` evaluates them.
             let (mut ic_vec, _) = self.seeded_defaults(slots);
-            let _ = self.seed_initialization_faqs(
+            let _ = self.seed_initialization_equations(
                 &mut ic_vec,
                 &resolved,
                 &HashSet::new(),
@@ -2048,7 +2107,7 @@ impl ArrayCompiled {
         // After the overrides, so a body reading a state reads the caller's
         // value, and around them, so the caller's value stands.
         for slot in
-            self.seed_initialization_faqs(&mut ic_vec, &resolved_params, &overridden, None)?
+            self.seed_initialization_equations(&mut ic_vec, &resolved_params, &overridden, None)?
         {
             if let Some(u) = unset.as_mut() {
                 u[slot] = false;
