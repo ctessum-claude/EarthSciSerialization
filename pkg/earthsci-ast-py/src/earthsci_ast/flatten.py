@@ -706,11 +706,12 @@ class FlattenedSystem:
     # `equations` is then directly usable as a right-hand side without filtering,
     # and its length is comparable across bindings.
     field_ics: list[tuple[str, Expr]] = field(default_factory=list)
-    # The `faq`-valued initialization equations (esm-spec §6.2, equations that
-    # hold at t = 0) as ordered, namespaced `(target_state, faq)` pairs: each
-    # assigns the cells of its ranges when the initial state is built. The other
-    # spellings of an initialization equation name no cells and are not carried.
-    initialization_faqs: list[tuple[str, Expr]] = field(default_factory=list)
+    # Every component's `initialization_equations` (esm-spec §6.2, equations
+    # that hold at t = 0), in document order, named as `equations` are
+    # (esm-libraries-spec §4.7.5 step 4): namespaced in the component's scope,
+    # then rewritten by the `variable_map` substitution. The build applies each
+    # one with a bare-variable left-hand side when it builds the initial state.
+    initialization_equations: list[FlattenedEquation] = field(default_factory=list)
 
     @property
     def system_kind(self) -> str:
@@ -1182,7 +1183,7 @@ class _ComponentSystem:
     observed: OrderedDict[str, FlattenedVariable] = field(default_factory=OrderedDict)
     equations: list[FlattenedEquation] = field(default_factory=list)
     loader_fields: list[LoaderField] = field(default_factory=list)
-    initialization_faqs: list[tuple[str, Expr]] = field(default_factory=list)
+    initialization_equations: list[FlattenedEquation] = field(default_factory=list)
 
     def merge(self, other: _ComponentSystem) -> None:
         """Fold ``other``'s tables into this component (last-writer-wins for the
@@ -1198,7 +1199,7 @@ class _ComponentSystem:
         self.observed.update(other.observed)
         self.equations.extend(other.equations)
         self.loader_fields.extend(other.loader_fields)
-        self.initialization_faqs.extend(other.initialization_faqs)
+        self.initialization_equations.extend(other.initialization_equations)
 
 
 def _namespace_variable_update(
@@ -1565,34 +1566,22 @@ def _collect_model(
         locals_=locals_,
     )
 
-    # The `faq`-valued initialization equations (esm-spec §6.2), namespaced in
-    # the same scope as the equations.
+    # The initialization equations (esm-spec §6.2), namespaced in the same scope
+    # as the equations.
     for eq in model.initialization_equations:
-        rhs = eq.rhs
-        if (
-            isinstance(eq.lhs, str)
-            and isinstance(rhs, ExprNode)
-            and is_aggregate_op(rhs.op)
-            and rhs.output_idx
-        ):
-            component.initialization_faqs.append(
-                (
-                    _namespace_expr(
-                        eq.lhs,
-                        full_prefix,
-                        leave_alone=leave_alone,
-                        subsystem_keys=sub_keys,
-                        locals_=locals_,
-                    ),
-                    _namespace_expr(
-                        rhs,
-                        full_prefix,
-                        leave_alone=leave_alone,
-                        subsystem_keys=sub_keys,
-                        locals_=locals_,
-                    ),
-                )
+        lhs, rhs = (
+            _namespace_expr(
+                side,
+                full_prefix,
+                leave_alone=leave_alone,
+                subsystem_keys=sub_keys,
+                locals_=locals_,
             )
+            for side in (eq.lhs, eq.rhs)
+        )
+        component.initialization_equations.append(
+            FlattenedEquation(lhs=lhs, rhs=rhs, source_system=component.name)
+        )
 
     # Data-fed parameters (esm-spec §8.5): the simulator executes each source at
     # its cadence and binds the array under the parameter's namespaced name.
@@ -2577,6 +2566,10 @@ def _apply_variable_map(
             _map_contributions(eq, rewrite, lhs=substitute(eq.lhs, bindings))
             for eq in comp.equations
         ]
+        comp.initialization_equations = [
+            replace(eq, lhs=substitute(eq.lhs, bindings), rhs=rewrite(eq.rhs))
+            for eq in comp.initialization_equations
+        ]
         # A bound naming the target follows the replacement too (esm-libraries-
         # spec §4.7.5): the source's name, or the scaled source Expression.
         for table in (comp.state_vars, comp.parameters, comp.observed):
@@ -3001,7 +2994,7 @@ def _assemble_system(
     for name, var in combined.observed.items():
         flat.observed_variables[name] = var
     flat.loader_fields.extend(combined.loader_fields)
-    flat.initialization_faqs.extend(combined.initialization_faqs)
+    flat.initialization_equations.extend(combined.initialization_equations)
 
     seen_lhs: dict[str, FlattenedEquation] = {}
     for eq in combined.equations:
@@ -3607,6 +3600,9 @@ def _normalize_angle_arguments(flat: FlattenedSystem) -> None:
 
     flat.equations = [_map_contributions(eq, rewrite) for eq in flat.equations]
     flat.field_ics = [(name, rewrite(expr)) for name, expr in flat.field_ics]
+    flat.initialization_equations = [
+        replace(eq, rhs=rewrite(eq.rhs)) for eq in flat.initialization_equations
+    ]
     # Events are rewritten too, although no evaluator in THIS binding runs one
     # (`unsupported_construct`, esm-spec §9.6.6). The flattened form is a
     # cross-binding artefact — the Julia binding exports it to

@@ -37,7 +37,9 @@ from .flatten import (
 )
 from .simulation_array import (
     _densify_solution,
+    _eval_buildtime_field,
     _saveat_times,
+    applied_initialization_equations,
     scalar_ic_equations,
     start_of_run_scalar_ics,
 )
@@ -259,10 +261,10 @@ def _build_scalar_rhs(
             event_functions=[],
         )
 
-    # Initial conditions, in the esm-spec §11.4 precedence: an explicit
-    # ``initial_conditions`` override (dot-namespaced key, then bare name)
-    # wins; else this state's own ``ic`` equation; else the declared
-    # ``default``; else 0.
+    # Initial conditions, in the esm-spec §11.4 precedence (CONFORMANCE_SPEC
+    # §5.53): an explicit ``initial_conditions`` override (dot-namespaced key,
+    # then bare name) wins; else an initialization equation (esm-spec §6.2);
+    # else this state's own ``ic`` equation; else the declared ``default``.
     #
     # The ``ic`` tier used to be MISSING on this pathway. `_compile_flat_rhs`
     # lowers only `D(x)/dt = …` / algebraic equations, so an `ic`-LHS
@@ -284,23 +286,21 @@ def _build_scalar_rhs(
     known_states = set(flat.state_variables)
     state_namespaces = flat_namespace_scope(flat)
     unset: list[str] = []
+    overridden: set[str] = set()
     # Only an ODE state needs a starting value; an algebraic one is overwritten
     # from its definition below.
     ode = set().union(*(_derivative_targets(eq.lhs) for eq in flat.equations))
     for name in state_names:
         default = eq_ics.get(name, flat.state_variables[name].default)
-        if name in ode and (
-            resolve_override_raw(
-                name,
-                initial_conditions,
-                default,
-                known=known_states,
-                namespaces=state_namespaces,
-                surface="initial_conditions",
-                kind="state",
-            )
-            is None
-        ):
+        override = dict(
+            known=known_states,
+            namespaces=state_namespaces,
+            surface="initial_conditions",
+            kind="state",
+        )
+        if resolve_override_raw(name, initial_conditions, None, **override) is not None:
+            overridden.add(name)
+        elif name in ode and default is None:
             unset.append(name)
         y0_list.append(
             _resolve_override(
@@ -313,10 +313,28 @@ def _build_scalar_rhs(
                 kind="state",
             )
         )
+    y0 = np.array(y0_list)
+    # The initialization equations (esm-spec §6.2), in order: after the
+    # overrides, so a right-hand side reading a state reads the caller's value,
+    # and around them, so the caller's value stands.
+    init_eqs = applied_initialization_equations(flat)
+    if init_eqs:
+        params = dict(zip(compiled.parameter_names, param_values))
+        position = {n: i for i, n in enumerate(state_names)}
+        for target, rhs in init_eqs:
+            if target not in position or target in overridden:
+                continue
+            scope = {n: np.asarray(y0[i]) for n, i in position.items()}
+            y0[position[target]] = float(
+                _eval_buildtime_field(
+                    rhs, index_sets=flat.index_sets, param_values=params, input_arrays=scope
+                )
+            )
+            if target in unset:
+                unset.remove(target)
     if unset:
         # esm-spec §11.4: an unknown with no starting value.
         raise MissingInitialValueError(unset)
-    y0 = np.array(y0_list)
 
     # Override y0 for algebraic states so the t=0 sample is consistent.
     algebraic_vector_func = compiled.algebraic_vector_func

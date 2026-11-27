@@ -1,0 +1,226 @@
+{
+  "esm": "2.1.0",
+  "metadata": {
+    "name": "initialization_equation_scalar",
+    "description": "esm-spec 6.2 initialization equations on 0-D unknowns, in the spelling `x ~ <expression>` (EarthSciAST issue 817). `x` declares no default and no `ic`: its only starting value is `x ~ x0`, which esm-spec 11.4 counts. `z ~ x + 1` reads the state the equation before it seeded. `s` has a declared default and an `ic` equation as well as `s ~ 3*x0`: the initialization equation wins (CONFORMANCE_SPEC 5.53 and API_SPEC 5.8 `initial_state`: per element the first of the caller's u0 entry, an initialization equation, an `ic` equation, the declared default). `y` integrates `x`, so the seeded value has to reach the trajectory.",
+    "authors": [
+      "EarthSciAST"
+    ],
+    "tags": [
+      "inline-test",
+      "esm-spec-6.2",
+      "esm-spec-11.4",
+      "initialization-equations",
+      "initial-conditions",
+      "zero-dimensional"
+    ]
+  },
+  "models": {
+    "M": {
+      "variables": {
+        "x0": {
+          "type": "parameter",
+          "units": "1",
+          "default": 2.0,
+          "description": "Starting value of x."
+        },
+        "x": {
+          "type": "unknown",
+          "units": "1",
+          "description": "No default and no ic: seeded only by x ~ x0; held constant."
+        },
+        "z": {
+          "type": "unknown",
+          "units": "1",
+          "description": "No default: seeded by z ~ x + 1, which reads the seeded x; held constant."
+        },
+        "s": {
+          "type": "unknown",
+          "units": "1",
+          "default": 1.0,
+          "description": "Default 1 and ic 5, but the initialization equation s ~ 3*x0 gives its starting value."
+        },
+        "y": {
+          "type": "unknown",
+          "units": "1",
+          "default": 0.0,
+          "description": "Integrates x from 0, so y(1) = x(0)."
+        }
+      },
+      "equations": [
+        {
+          "lhs": {
+            "op": "D",
+            "args": [
+              "x"
+            ],
+            "wrt": "t"
+          },
+          "rhs": 0
+        },
+        {
+          "lhs": {
+            "op": "D",
+            "args": [
+              "z"
+            ],
+            "wrt": "t"
+          },
+          "rhs": 0
+        },
+        {
+          "lhs": {
+            "op": "D",
+            "args": [
+              "s"
+            ],
+            "wrt": "t"
+          },
+          "rhs": 0
+        },
+        {
+          "lhs": {
+            "op": "D",
+            "args": [
+              "y"
+            ],
+            "wrt": "t"
+          },
+          "rhs": "x"
+        },
+        {
+          "lhs": {
+            "op": "ic",
+            "args": [
+              "s"
+            ]
+          },
+          "rhs": 5.0
+        }
+      ],
+      "initialization_equations": [
+        {
+          "lhs": "x",
+          "rhs": "x0"
+        },
+        {
+          "lhs": "z",
+          "rhs": {
+            "op": "+",
+            "args": [
+              "x",
+              1
+            ]
+          }
+        },
+        {
+          "lhs": "s",
+          "rhs": {
+            "op": "*",
+            "args": [
+              3,
+              "x0"
+            ]
+          }
+        }
+      ],
+      "tolerance": {
+        "rel": 1e-09,
+        "abs": 1e-11
+      },
+      "tests": [
+        {
+          "id": "init_scalar_defaults",
+          "description": "x = x0 = 2, z = x + 1 = 3, s = 3*x0 = 6 over its ic (5) and default (1); y(1) = x(0).",
+          "time_span": {
+            "start": 0.0,
+            "end": 1.0
+          },
+          "assertions": [
+            {
+              "variable": "x",
+              "time": 0.0,
+              "expected": 2.0
+            },
+            {
+              "variable": "z",
+              "time": 0.0,
+              "expected": 3.0
+            },
+            {
+              "variable": "s",
+              "time": 0.0,
+              "expected": 6.0
+            },
+            {
+              "variable": "y",
+              "time": 1.0,
+              "expected": 2.0
+            }
+          ]
+        },
+        {
+          "id": "init_scalar_parameter_override",
+          "description": "parameter_overrides {x0: 4} reaches every initialization equation that reads it, directly or through x.",
+          "parameter_overrides": {
+            "x0": 4.0
+          },
+          "time_span": {
+            "start": 0.0,
+            "end": 1.0
+          },
+          "assertions": [
+            {
+              "variable": "x",
+              "time": 0.0,
+              "expected": 4.0
+            },
+            {
+              "variable": "z",
+              "time": 0.0,
+              "expected": 5.0
+            },
+            {
+              "variable": "s",
+              "time": 0.0,
+              "expected": 12.0
+            },
+            {
+              "variable": "y",
+              "time": 1.0,
+              "expected": 4.0
+            }
+          ]
+        },
+        {
+          "id": "init_scalar_run_override",
+          "description": "A run's initial_conditions entry for x beats its initialization equation, and z reads the overridden x.",
+          "initial_conditions": {
+            "x": 9.0
+          },
+          "time_span": {
+            "start": 0.0,
+            "end": 1.0
+          },
+          "assertions": [
+            {
+              "variable": "x",
+              "time": 0.0,
+              "expected": 9.0
+            },
+            {
+              "variable": "z",
+              "time": 0.0,
+              "expected": 10.0
+            },
+            {
+              "variable": "s",
+              "time": 0.0,
+              "expected": 6.0
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

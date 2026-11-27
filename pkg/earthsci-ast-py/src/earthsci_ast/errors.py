@@ -167,8 +167,9 @@ class MissingDataError(SimulationError):
 
 class MissingInitialValueError(SimulationError):
     """``E_TREEWALK_MISSING_INITIAL_VALUE``: an unknown that needs a starting
-    value reached construction with none — no ``default``, no initial condition
-    or ``ic`` equation, and no caller ``u0`` (esm-spec §11.4). Julia and Rust
+    value reached construction with none — no ``default``, no initial condition,
+    ``ic`` equation or initialization equation, and no caller ``u0`` (esm-spec
+    §11.4). Julia and Rust
     raise the same code.
     """
 
@@ -180,9 +181,10 @@ class MissingInitialValueError(SimulationError):
         first = self.names[0]
         super().__init__(
             f"{self.code}: no starting value for {len(self.names)} unknown(s) ({shown}): "
-            "the unknown declares no `default`, and no initial condition, `ic` equation or "
-            "caller `u0` sets it. An unknown with no starting value is an error when a problem "
-            f"is built (esm-spec §11.4). To supply it, pass `u0={{'{first}': value}}` to "
+            "the unknown declares no `default`, and no initial condition, `ic` equation, "
+            "initialization equation or caller `u0` sets it. An unknown with no starting value "
+            "is an error when a problem is built (esm-spec §11.4). To supply it, pass "
+            f"`u0={{'{first}': value}}` to "
             "`esm_problem`, or declare a `default` on the unknown."
         )
 

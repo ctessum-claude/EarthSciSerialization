@@ -384,43 +384,89 @@ def _faq_output_ranges(node: ExprNode, index_sets: dict[str, Any]) -> list[tuple
     return out
 
 
-def _seed_initialization_faqs(
+def is_cell_assigning_faq(rhs: Expr) -> bool:
+    """Whether ``rhs`` is a ``faq`` with output indices: an initialization
+    equation ``u ~ faq(…)`` that assigns the cells of its ranges."""
+    return isinstance(rhs, ExprNode) and is_aggregate_op(rhs.op) and bool(rhs.output_idx)
+
+
+def applied_initialization_equations(flat: FlattenedSystem) -> list[tuple[str, Expr]]:
+    """The initialization equations (esm-spec §6.2) the build applies, as
+    ``(target, rhs)`` in document order: those with a bare-variable left-hand
+    side. Any other left-hand side names no target to assign."""
+    return [
+        (eq.lhs, eq.rhs) for eq in flat.initialization_equations if isinstance(eq.lhs, str)
+    ]
+
+
+def _seed_initialization_equations(
     y0: np.ndarray,
-    init_faqs: list[tuple[str, Expr]],
+    init_eqs: list[tuple[str, Expr]],
     shapes: dict[str, tuple[int, ...]],
     state_layout: dict[str, slice],
     scope_arrays: dict[str, np.ndarray],
     *,
     keep: set[int],
+    var_axes: dict[str, tuple[str, ...]],
     index_sets: dict[str, Any] | None = None,
     param_values: dict[str, float] | None = None,
 ) -> None:
-    """Evaluate the ``faq``-valued initialization equations (esm-spec §6.2:
-    equations that hold at t = 0) into ``y0``, in document order.
+    """Evaluate the initialization equations (esm-spec §6.2: equations that
+    hold at t = 0) into ``y0``, in document order.
 
-    Each assigns every cell of its ranges the value its body takes there, read
-    against the initial state seeded so far (defaults, field ``ic``s, the
-    caller's overrides and the equations before it), the parameters and the
-    loaded fields, at t = 0. A cell in ``keep`` — one the caller's initial
-    conditions name — keeps its value. Mirrors the Julia reference's
-    ``_seed_faq_init_u0!`` and Rust's ``seed_initialization_faqs``.
+    ``u ~ faq(…)`` assigns every cell of its ranges the value its body takes
+    there. Any other right-hand side gives the whole target its value: a scalar
+    one replicated over an array target, an array one aligned with the target's
+    axes by index-set NAME (esm-spec §4.3.4, :func:`align_expression`), so a
+    lower-rank operand repeats along the axes it does not carry and a
+    name-permuted one transposes. Each is read against the initial state seeded
+    so far (defaults, field ``ic``s, the caller's overrides and the equations
+    before it), the parameters and the loaded fields, at t = 0. A slot in
+    ``keep`` — one the caller's initial conditions name — keeps its value.
+    Mirrors the Julia reference's ``_seed_init_u0!`` and Rust's
+    ``seed_initialization_equations``.
     """
-    for target, rhs in init_faqs:
+    sizes = axis_sizes(index_sets or {})
+    for target, rhs in init_eqs:
         rule = f"init({target})"
         if target not in state_layout:
             raise SimulationError(
-                f"{rule}: the left-hand side of a faq initialization equation is not a "
+                f"{rule}: the left-hand side of an initialization equation is not a "
                 f"state variable of the flattened system"
             )
         shape = tuple(shapes.get(target, ()))
+        arrays = dict(scope_arrays)
+        for name, sl in state_layout.items():
+            arrays[name] = y0[sl].reshape(shapes.get(name, ()))
+        start = state_layout[target].start
+        if not is_cell_assigning_faq(rhs):
+            axes = var_axes.get(target)
+            if axes:
+                _refuse_unalignable_operand(target, rhs, var_axes)
+                rhs = align_expression(rhs, axes, var_axes, sizes)
+            value = np.asarray(
+                _eval_buildtime_field(
+                    rhs, index_sets=index_sets, param_values=param_values, input_arrays=arrays
+                ),
+                dtype=float,
+            )
+            try:
+                value = np.broadcast_to(value, shape)
+            except ValueError as err:
+                raise SimulationError(
+                    f"{rule}: the right-hand side has shape {value.shape}, which does not "
+                    f"broadcast over the target's {shape}"
+                ) from err
+            for multi in np.ndindex(*shape):
+                pos = start + _linear_pos(shape, [k + 1 for k in multi])
+                if pos not in keep:
+                    y0[pos] = float(value[multi])
+            continue
         ranges = _faq_output_ranges(rhs, index_sets or {})
         if len(ranges) != len(shape):
             raise SimulationError(
                 f"{rule}: {len(ranges)} output indices for a {len(shape)}-D state"
             )
-        arrays = dict(scope_arrays)
-        for name, sl in state_layout.items():
-            arrays[name] = y0[sl].reshape(shapes.get(name, ()))
         value = np.asarray(
             _eval_buildtime_field(
                 rhs, index_sets=index_sets, param_values=param_values, input_arrays=arrays
@@ -432,7 +478,6 @@ def _seed_initialization_faqs(
             raise SimulationError(
                 f"{rule}: the faq evaluated to shape {value.shape}, not its box {extents}"
             )
-        start = state_layout[target].start
         for multi in np.ndindex(*extents):
             cell = [lo + int(k) for k, (lo, _) in zip(multi, ranges)]
             pos = start + _linear_pos(shape, cell)
@@ -3327,16 +3372,17 @@ def _build_numpy_rhs(
     overridden = _apply_initial_conditions(
         y0, state_layout, shapes, state_names, initial_conditions
     )
-    # The faq-valued initialization equations (esm-spec §6.2): after the
-    # overrides, so a body reading a state reads the caller's value, and
-    # around them, so the caller's value stands.
-    _seed_initialization_faqs(
+    # The initialization equations (esm-spec §6.2): after the overrides, so a
+    # body reading a state reads the caller's value, and around them, so the
+    # caller's value stands.
+    _seed_initialization_equations(
         y0,
-        flat.initialization_faqs,
+        applied_initialization_equations(flat),
         shapes,
         state_layout,
         ic_scope_arrays,
         keep=overridden,
+        var_axes=var_axes,
         index_sets=flat.index_sets,
         param_values=param_values,
     )

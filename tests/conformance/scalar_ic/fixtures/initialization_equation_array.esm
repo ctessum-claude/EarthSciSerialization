@@ -1,0 +1,703 @@
+{
+  "esm": "2.1.0",
+  "metadata": {
+    "name": "initialization_equation_array",
+    "description": "esm-spec 6.2 initialization equations on array unknowns whose right-hand side is not a `faq` (EarthSciAST issue 817). Each is read elementwise over the target's declared shape, its operands aligned by index-set name (esm-spec 4.3.4 rule 1). `u ~ p0` is a bare array name; `v ~ 2*p0 + c` a whole-array expression with a scalar operand; `aw ~ p0` puts a [lev] operand in a [lev, bin] target, so p0 repeats along bin (the MOSAIC Kelvin case); `cw ~ r0 + p0` adds a [bin] operand, which aligns with the target's SECOND axis by name (a positional reading pads it on the trailing axis and gives wrong values); `bw ~ q0 * aw` multiplies a full-rank parameter by the state seeded the equation before. No unknown here declares a default, so each would be refused without its initialization equation. `y` integrates `u`.",
+    "authors": [
+      "EarthSciAST"
+    ],
+    "tags": [
+      "inline-test",
+      "esm-spec-6.2",
+      "esm-spec-4.3.4",
+      "esm-spec-11.4",
+      "initialization-equations",
+      "initial-conditions",
+      "broadcast"
+    ]
+  },
+  "index_sets": {
+    "lev": {
+      "kind": "interval",
+      "size": 3
+    },
+    "bin": {
+      "kind": "interval",
+      "size": 2
+    }
+  },
+  "models": {
+    "A": {
+      "variables": {
+        "c": {
+          "type": "parameter",
+          "units": "1",
+          "default": 0.5,
+          "description": "Scalar offset in v's initialization equation."
+        },
+        "p0": {
+          "type": "parameter",
+          "units": "1",
+          "shape": [
+            "lev"
+          ],
+          "default": [
+            1.0,
+            2.0,
+            3.0
+          ],
+          "description": "Per-level starting values."
+        },
+        "r0": {
+          "type": "parameter",
+          "units": "1",
+          "shape": [
+            "bin"
+          ],
+          "default": [
+            10.0,
+            20.0
+          ],
+          "description": "Per-bin offsets."
+        },
+        "q0": {
+          "type": "parameter",
+          "units": "1",
+          "shape": [
+            "lev",
+            "bin"
+          ],
+          "default": [
+            [
+              1.0,
+              2.0
+            ],
+            [
+              3.0,
+              4.0
+            ],
+            [
+              5.0,
+              6.0
+            ]
+          ],
+          "description": "Per-level, per-bin factors."
+        },
+        "u": {
+          "type": "unknown",
+          "units": "1",
+          "shape": [
+            "lev"
+          ],
+          "description": "u ~ p0."
+        },
+        "v": {
+          "type": "unknown",
+          "units": "1",
+          "shape": [
+            "lev"
+          ],
+          "description": "v ~ 2*p0 + c."
+        },
+        "aw": {
+          "type": "unknown",
+          "units": "1",
+          "shape": [
+            "lev",
+            "bin"
+          ],
+          "description": "aw ~ p0: p0 repeats along bin."
+        },
+        "cw": {
+          "type": "unknown",
+          "units": "1",
+          "shape": [
+            "lev",
+            "bin"
+          ],
+          "description": "cw ~ r0 + p0: cw[k, b] = r0[b] + p0[k]."
+        },
+        "bw": {
+          "type": "unknown",
+          "units": "1",
+          "shape": [
+            "lev",
+            "bin"
+          ],
+          "description": "bw ~ q0 * aw, reading the seeded aw."
+        },
+        "y": {
+          "type": "unknown",
+          "units": "1",
+          "shape": [
+            "lev"
+          ],
+          "default": 0.0,
+          "description": "Integrates u from 0, so y(1) = u(0)."
+        }
+      },
+      "equations": [
+        {
+          "lhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              }
+            },
+            "expr": {
+              "op": "D",
+              "args": [
+                {
+                  "op": "index",
+                  "args": [
+                    "u",
+                    "i"
+                  ]
+                }
+              ],
+              "wrt": "t"
+            }
+          },
+          "rhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              }
+            },
+            "expr": 0
+          }
+        },
+        {
+          "lhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              }
+            },
+            "expr": {
+              "op": "D",
+              "args": [
+                {
+                  "op": "index",
+                  "args": [
+                    "v",
+                    "i"
+                  ]
+                }
+              ],
+              "wrt": "t"
+            }
+          },
+          "rhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              }
+            },
+            "expr": 0
+          }
+        },
+        {
+          "lhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i",
+              "j"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              },
+              "j": {
+                "from": "bin"
+              }
+            },
+            "expr": {
+              "op": "D",
+              "args": [
+                {
+                  "op": "index",
+                  "args": [
+                    "aw",
+                    "i",
+                    "j"
+                  ]
+                }
+              ],
+              "wrt": "t"
+            }
+          },
+          "rhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i",
+              "j"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              },
+              "j": {
+                "from": "bin"
+              }
+            },
+            "expr": 0
+          }
+        },
+        {
+          "lhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i",
+              "j"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              },
+              "j": {
+                "from": "bin"
+              }
+            },
+            "expr": {
+              "op": "D",
+              "args": [
+                {
+                  "op": "index",
+                  "args": [
+                    "cw",
+                    "i",
+                    "j"
+                  ]
+                }
+              ],
+              "wrt": "t"
+            }
+          },
+          "rhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i",
+              "j"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              },
+              "j": {
+                "from": "bin"
+              }
+            },
+            "expr": 0
+          }
+        },
+        {
+          "lhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i",
+              "j"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              },
+              "j": {
+                "from": "bin"
+              }
+            },
+            "expr": {
+              "op": "D",
+              "args": [
+                {
+                  "op": "index",
+                  "args": [
+                    "bw",
+                    "i",
+                    "j"
+                  ]
+                }
+              ],
+              "wrt": "t"
+            }
+          },
+          "rhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i",
+              "j"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              },
+              "j": {
+                "from": "bin"
+              }
+            },
+            "expr": 0
+          }
+        },
+        {
+          "lhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              }
+            },
+            "expr": {
+              "op": "D",
+              "args": [
+                {
+                  "op": "index",
+                  "args": [
+                    "y",
+                    "i"
+                  ]
+                }
+              ],
+              "wrt": "t"
+            }
+          },
+          "rhs": {
+            "op": "faq",
+            "args": [],
+            "output_idx": [
+              "i"
+            ],
+            "ranges": {
+              "i": {
+                "from": "lev"
+              }
+            },
+            "expr": {
+              "op": "index",
+              "args": [
+                "u",
+                "i"
+              ]
+            }
+          }
+        }
+      ],
+      "initialization_equations": [
+        {
+          "lhs": "u",
+          "rhs": "p0"
+        },
+        {
+          "lhs": "v",
+          "rhs": {
+            "op": "+",
+            "args": [
+              {
+                "op": "*",
+                "args": [
+                  2,
+                  "p0"
+                ]
+              },
+              "c"
+            ]
+          }
+        },
+        {
+          "lhs": "aw",
+          "rhs": "p0"
+        },
+        {
+          "lhs": "cw",
+          "rhs": {
+            "op": "+",
+            "args": [
+              "r0",
+              "p0"
+            ]
+          }
+        },
+        {
+          "lhs": "bw",
+          "rhs": {
+            "op": "*",
+            "args": [
+              "q0",
+              "aw"
+            ]
+          }
+        }
+      ],
+      "tolerance": {
+        "rel": 1e-09,
+        "abs": 1e-11
+      },
+      "tests": [
+        {
+          "id": "init_array_defaults",
+          "description": "u = p0; v = 2*p0 + 0.5; aw[k, b] = p0[k]; cw[k, b] = r0[b] + p0[k]; bw[k, b] = q0[k, b]*p0[k]; y(1) = u(0).",
+          "time_span": {
+            "start": 0.0,
+            "end": 1.0
+          },
+          "assertions": [
+            {
+              "variable": "u",
+              "time": 0.0,
+              "expected": 1.0,
+              "coords": {
+                "lev": 1
+              }
+            },
+            {
+              "variable": "u",
+              "time": 0.0,
+              "expected": 3.0,
+              "coords": {
+                "lev": 3
+              }
+            },
+            {
+              "variable": "v",
+              "time": 0.0,
+              "expected": 2.5,
+              "coords": {
+                "lev": 1
+              }
+            },
+            {
+              "variable": "v",
+              "time": 0.0,
+              "expected": 6.5,
+              "coords": {
+                "lev": 3
+              }
+            },
+            {
+              "variable": "aw",
+              "time": 0.0,
+              "expected": 1.0,
+              "coords": {
+                "lev": 1,
+                "bin": 1
+              }
+            },
+            {
+              "variable": "aw",
+              "time": 0.0,
+              "expected": 1.0,
+              "coords": {
+                "lev": 1,
+                "bin": 2
+              }
+            },
+            {
+              "variable": "aw",
+              "time": 0.0,
+              "expected": 2.0,
+              "coords": {
+                "lev": 2,
+                "bin": 2
+              }
+            },
+            {
+              "variable": "aw",
+              "time": 0.0,
+              "expected": 3.0,
+              "coords": {
+                "lev": 3,
+                "bin": 1
+              }
+            },
+            {
+              "variable": "cw",
+              "time": 0.0,
+              "expected": 11.0,
+              "coords": {
+                "lev": 1,
+                "bin": 1
+              }
+            },
+            {
+              "variable": "cw",
+              "time": 0.0,
+              "expected": 21.0,
+              "coords": {
+                "lev": 1,
+                "bin": 2
+              }
+            },
+            {
+              "variable": "cw",
+              "time": 0.0,
+              "expected": 12.0,
+              "coords": {
+                "lev": 2,
+                "bin": 1
+              }
+            },
+            {
+              "variable": "cw",
+              "time": 0.0,
+              "expected": 23.0,
+              "coords": {
+                "lev": 3,
+                "bin": 2
+              }
+            },
+            {
+              "variable": "bw",
+              "time": 0.0,
+              "expected": 1.0,
+              "coords": {
+                "lev": 1,
+                "bin": 1
+              }
+            },
+            {
+              "variable": "bw",
+              "time": 0.0,
+              "expected": 8.0,
+              "coords": {
+                "lev": 2,
+                "bin": 2
+              }
+            },
+            {
+              "variable": "bw",
+              "time": 0.0,
+              "expected": 15.0,
+              "coords": {
+                "lev": 3,
+                "bin": 1
+              }
+            },
+            {
+              "variable": "y",
+              "time": 1.0,
+              "expected": 2.0,
+              "coords": {
+                "lev": 2
+              }
+            }
+          ]
+        },
+        {
+          "id": "init_array_parameter_override",
+          "description": "parameter_overrides {c: 1.5} reaches v's initialization equation only.",
+          "parameter_overrides": {
+            "c": 1.5
+          },
+          "time_span": {
+            "start": 0.0,
+            "end": 1.0
+          },
+          "assertions": [
+            {
+              "variable": "v",
+              "time": 0.0,
+              "expected": 3.5,
+              "coords": {
+                "lev": 1
+              }
+            },
+            {
+              "variable": "v",
+              "time": 0.0,
+              "expected": 7.5,
+              "coords": {
+                "lev": 3
+              }
+            },
+            {
+              "variable": "u",
+              "time": 0.0,
+              "expected": 2.0,
+              "coords": {
+                "lev": 2
+              }
+            }
+          ]
+        },
+        {
+          "id": "init_array_run_override",
+          "description": "A run's initial_conditions entry for aw[2,1] beats the initialization equation for that cell only, and bw reads it.",
+          "initial_conditions": {
+            "aw[2,1]": 7.0
+          },
+          "time_span": {
+            "start": 0.0,
+            "end": 1.0
+          },
+          "assertions": [
+            {
+              "variable": "aw",
+              "time": 0.0,
+              "expected": 7.0,
+              "coords": {
+                "lev": 2,
+                "bin": 1
+              }
+            },
+            {
+              "variable": "aw",
+              "time": 0.0,
+              "expected": 2.0,
+              "coords": {
+                "lev": 2,
+                "bin": 2
+              }
+            },
+            {
+              "variable": "bw",
+              "time": 0.0,
+              "expected": 21.0,
+              "coords": {
+                "lev": 2,
+                "bin": 1
+              }
+            },
+            {
+              "variable": "bw",
+              "time": 0.0,
+              "expected": 8.0,
+              "coords": {
+                "lev": 2,
+                "bin": 2
+              }
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
